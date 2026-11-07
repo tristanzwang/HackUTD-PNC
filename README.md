@@ -1,2 +1,3 @@
-# HackUTD
-2026 HackUTD Project
+# <HackUTD 2026>
+
+HackUTD 2026. Setup in progress.
