@@ -27,11 +27,11 @@ export type SceneCategory = {
    */
   slot: number;
   /**
-   * Orbit index, 0-7. This decides orbit RADIUS and speed, so it is ordered by
-   * liquidity and time horizon: checking is innermost and fast, retirement is
-   * outermost and slow. Deliberately NOT the same as `slot` - coupling them
-   * would force the biggest category to also be the innermost planet, which
-   * is wrong (retirement is huge and should be far out).
+   * Orbit index, 0-7. This decides orbit RADIUS and speed, and encodes the
+   * user's PRIORITY: the closer to the sun (lower index), the more they said the
+   * category matters. Set from the priority editor, defaulting to
+   * DEFAULT_PRIORITY. `slot` still means node budget by size - deliberately NOT
+   * the same, since the biggest body is not necessarily the most protected.
    */
   orbit: number;
   color: string;
@@ -39,11 +39,47 @@ export type SceneCategory = {
   isDebt: boolean;
 };
 
-/** Ordering for orbit radius: liquid and near-term first, locked-away last. */
-const BY_HORIZON: CategoryKey[] = [
-  "checking", "essentials", "discretionary", "subscriptions",
-  "housing", "card", "savings", "retirement",
+/**
+ * Default orbit priority, innermost first: what the user protects first. The
+ * priority editor reorders this at runtime; orbit radius then follows the user's
+ * own ranking rather than liquidity.
+ */
+export const DEFAULT_PRIORITY: CategoryKey[] = [
+  "housing", "essentials", "card", "savings",
+  "retirement", "subscriptions", "discretionary", "checking",
 ];
+
+/**
+ * Illustrative per-category inflation, as a yearly fraction. Drives the sunward
+ * drift in the orbit view: the sun is inflation, so higher-inflation categories
+ * fall toward it faster. Not financial advice — demo constants.
+ */
+export const INFLATION: Partial<Record<CategoryKey, number>> = {
+  housing: 0.05,
+  essentials: 0.055,
+  card: 0.07,
+  savings: 0.02,
+  retirement: 0.03,
+  subscriptions: 0.045,
+  discretionary: 0.05,
+  checking: 0.015,
+};
+
+/** Rank a key: its position in `priority`, or (after those) its DEFAULT_PRIORITY slot. */
+const rankIn = (priority: CategoryKey[]) => (k: CategoryKey) => {
+  const i = priority.indexOf(k);
+  return i >= 0 ? i : priority.length + DEFAULT_PRIORITY.indexOf(k);
+};
+
+/** Orbit index per category (0 = innermost) for a given priority order. */
+export function orbitOrder(
+  keys: CategoryKey[],
+  priority: CategoryKey[] = DEFAULT_PRIORITY,
+): Map<CategoryKey, number> {
+  const rank = rankIn(priority);
+  const sorted = [...keys].sort((a, b) => rank(a) - rank(b));
+  return new Map(sorted.map((k, i) => [k, i]));
+}
 
 const META: Record<string, { label: string; color: string; isDebt: boolean }> = {
   checking:      { label: "Checking",      color: "#06b6d4", isDebt: false },
@@ -57,18 +93,22 @@ const META: Record<string, { label: string; color: string; isDebt: boolean }> = 
 };
 
 /**
- * Build the scene layout from this month's amounts. Slots go by size, orbits
- * by horizon, so the two orderings are independent.
+ * Build the scene layout from this month's amounts. Slots go by size, orbits by
+ * the user's priority, so the two orderings are independent.
  */
-export function layout(amounts: Partial<Record<CategoryKey, number>>): SceneCategory[] {
-  const present = BY_HORIZON.filter((k) => (amounts[k] ?? 0) > 0);
+export function layout(
+  amounts: Partial<Record<CategoryKey, number>>,
+  priority: CategoryKey[] = DEFAULT_PRIORITY,
+): SceneCategory[] {
+  const present = (Object.keys(META) as CategoryKey[]).filter((k) => (amounts[k] ?? 0) > 0);
+  const order = orbitOrder(present, priority);
   const bySize = [...present].sort((a, b) => (amounts[b] ?? 0) - (amounts[a] ?? 0));
-  return present.map((key, orbit) => ({
+  return present.map((key) => ({
     key,
     label: META[key].label,
     amount: amounts[key] ?? 0,
     slot: bySize.indexOf(key),
-    orbit,
+    orbit: order.get(key)!,
     color: META[key].color,
     isDebt: META[key].isDebt,
   }));

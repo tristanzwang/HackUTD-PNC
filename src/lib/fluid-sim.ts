@@ -557,6 +557,21 @@ export class FluidSim {
         vel[j] = vel[j + 1] = vel[j + 2] = 0;
         continue;
       }
+      // A numerical blow-up (e.g. during the dense balling transition) can leave a
+      // position non-finite; the speed clamp below can't catch it (NaN > x is
+      // false), so it would poison the whole geometry and trip computeBoundingSphere.
+      // Reabsorb such a particle at the gravity point instead of stripping it.
+      if (
+        !Number.isFinite(pos[j]) ||
+        !Number.isFinite(pos[j + 1]) ||
+        !Number.isFinite(pos[j + 2])
+      ) {
+        pos[j] = prev[j] = this.orbitX;
+        pos[j + 1] = prev[j + 1] = this.orbitY;
+        pos[j + 2] = prev[j + 2] = this.orbitZ;
+        vel[j] = vel[j + 1] = vel[j + 2] = 0;
+        continue;
+      }
       let vx = (pos[j] - prev[j]) * inv;
       let vy = (pos[j + 1] - prev[j + 1]) * inv;
       let vz = (pos[j + 2] - prev[j + 2]) * inv;
@@ -921,6 +936,25 @@ export class FluidSim {
     this.pinned.fill(0);
     this.pinnedCount = 0;
     this.releaseGrab();
+  }
+
+  /**
+   * How crowded the points are around `center`, as a multiple of how crowded they are
+   * in the resting tank (1 = the tank's own spacing; a packed planet reads higher, a
+   * sparse edge lower). Counted in a sphere that is at most half full of fluid when
+   * `center` sits on its surface, so the count is doubled to compensate.
+   */
+  crowding(center: [number, number, number], radius: number): number {
+    const { count: n, pos } = this;
+    const [cx, cy, cz] = center;
+    const r2 = radius * radius;
+    let inside = 0;
+    for (let i = 0; i < n; i++) {
+      const dx = pos[i * 3] - cx, dy = pos[i * 3 + 1] - cy, dz = pos[i * 3 + 2] - cz;
+      if (dx * dx + dy * dy + dz * dz < r2) inside++;
+    }
+    const rest = ((4 / 3) * Math.PI * radius * radius * radius) / this.tankSpacing ** 3;
+    return rest > 0 ? (inside * 2) / rest : 0;
   }
 
   /**

@@ -9,14 +9,18 @@ const NO_STORE = { "Cache-Control": "no-store" };
 const clean = (e: unknown) =>
   (e instanceof Error ? e.message : "overseer failed").replace(/nvapi-[A-Za-z0-9_-]+/g, "nvapi-***");
 
+// the dataset on screen, so the facts Pluto may quote are the numbers the user sees
+const Persona = z.enum(["tristan", "yuva"]).optional();
+
 const Body = z.discriminatedUnion("action", [
-  z.object({ action: z.literal("brief"), profile: StoredProfile, messages: MessagesSchema }),
+  z.object({ action: z.literal("brief"), profile: StoredProfile, messages: MessagesSchema, persona: Persona }),
   z.object({
     action: z.literal("integrate"),
     profile: StoredProfile,
     messages: MessagesSchema,
     observations: z.array(ObservationSchema).max(5),
     askedAbout: z.string().max(120),
+    persona: Persona,
   }),
 ]);
 
@@ -38,7 +42,7 @@ export async function POST(request: NextRequest) {
   const body = parsed.data;
 
   try {
-    const projection = await getProjection({ adjustments: body.profile.adjustments });
+    const projection = await getProjection({ adjustments: body.profile.adjustments, persona: body.persona });
     const facts = buildFacts(projection);
 
     if (body.action === "brief") {

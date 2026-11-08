@@ -14,6 +14,7 @@ const Body = z.object({
   messages: MessagesSchema,
   profile: StoredProfile,
   brief: StoredBrief.nullable(),
+  persona: z.enum(["tristan", "yuva"]).optional(),
 });
 
 /**
@@ -27,7 +28,7 @@ export async function POST(request: NextRequest) {
   if (!parsed.success) {
     return Response.json({ error: "invalid request" }, { status: 400, headers: NO_STORE });
   }
-  const { mode, messages, profile, brief } = parsed.data;
+  const { mode, messages, profile, brief, persona } = parsed.data;
   if (mode === "reply" && messages.at(-1)?.role !== "user") {
     return Response.json({ error: "nothing to reply to" }, { status: 400, headers: NO_STORE });
   }
@@ -39,7 +40,7 @@ export async function POST(request: NextRequest) {
   }
 
   try {
-    const projection = await getProjection({ adjustments: profile.adjustments });
+    const projection = await getProjection({ adjustments: profile.adjustments, persona });
     const all = buildFacts(projection);
     // only the facts the overseer allowed; with no brief yet, a couple of the basics
     const facts = brief ? all.filter((f) => brief.mentionFactIds.includes(f.id)) : all.slice(0, 2);

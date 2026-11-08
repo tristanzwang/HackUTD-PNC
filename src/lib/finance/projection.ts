@@ -38,6 +38,8 @@ export type CategoryProjection = {
   history: number[];
   /** `horizon` months after the last history month, with an ~80% range. */
   forecast: { value: number; lo: number; hi: number }[];
+  /** The same horizon under plain carry-forward (naive), so the UI can show what the model changed. */
+  baseline: { value: number; lo: number; hi: number }[];
   model: ModelInfo;
   /** Plain-language reading of where this is heading, built from the numbers. */
   insight: string;
@@ -67,11 +69,19 @@ export type Projection = {
   summary: Summary;
   /** The user's plans that were applied. */
   adjustments: ForecastAdjustment[];
+  /** `summary` recomputed from the carry-forward baselines, for a before/after comparison. */
+  baselineSummary: Summary;
   agent: {
     /** True when Nemotron picked at least one model; false = every pick was the local heuristic. */
     live: boolean;
     note?: string;
   };
+  /**
+   * True when the forecasters were picked by the pre-built snapshot's Nemotron run
+   * rather than a run in this process (a cold start answers from it at once). The
+   * numbers themselves are always computed live from the current history and plans.
+   */
+  stale: boolean;
 };
 
 /** A model's pick for one category, however it was made. */
@@ -172,6 +182,33 @@ function insightFor(
 const ASSETS: CategoryKey[] = ["checking", "savings", "retirement"];
 const SPENDING: CategoryKey[] = ["housing", "essentials", "discretionary", "subscriptions"];
 
+/**
+ * Net worth, surplus, assets and debt for k = 0 (today) .. horizon, read from the
+ * categories' `forecast` (or `baseline`). Exported so a scenario overlay can
+ * recompute it from edited forecasts without duplicating the accounting rules.
+ */
+export function summaryOf(
+  categories: CategoryProjection[],
+  horizon: number,
+  which: "forecast" | "baseline" = "forecast",
+): Summary {
+  const at = (key: CategoryKey, k: number) => {
+    const c = categories.find((x) => x.key === key);
+    if (!c) return 0;
+    return k === 0 ? c.history[c.history.length - 1] : c[which][k - 1].value;
+  };
+  const s: Summary = { netWorth: [], surplus: [], assets: [], debt: [] };
+  for (let k = 0; k <= horizon; k++) {
+    const assets = ASSETS.reduce((a, key) => a + at(key, k), 0);
+    const debt = at("card", k);
+    s.assets.push(assets);
+    s.debt.push(debt);
+    s.netWorth.push(assets - debt);
+    s.surplus.push(at("income", k) - SPENDING.reduce((a, key) => a + at(key, k), 0));
+  }
+  return s;
+}
+
 function futureMonthLabels(last: string, horizon: number): string[] {
   const names = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"];
   const [mon, yr] = last.split(" ");
@@ -193,7 +230,7 @@ export function buildProjection(
   persona: Persona,
   horizon: number,
   choices: Partial<Record<CategoryKey, Choice>>,
-  meta: { version: string; generatedAt: string; note?: string },
+  meta: { version: string; generatedAt: string; note?: string; stale?: boolean },
   adjustments: ForecastAdjustment[] = [],
 ): Projection {
   const incomeNow = persona.series.income?.[persona.series.income.length - 1] ?? 0;
@@ -203,21 +240,28 @@ export function buildProjection(
     const y = persona.series[spec.key];
     const choice = choices[spec.key] ?? heuristicChoice(y, spec.kind);
     const f = fit(y, choice.spec);
-    return { spec, y, choice, forecast: project(f, horizon) };
+    // the same horizon under plain carry-forward, as a "what did the model change?" reference
+    const baseline = project(fit(y, { kind: "naive" }), horizon);
+    return { spec, y, choice, forecast: project(f, horizon), baseline };
   });
 
-  // 2. what the user told us changes, deterministically (see adjust.ts)
+  // 2. what the user told us changes, deterministically (see adjust.ts). The plans are
+  //    the user's own facts, not a model's reading, so they apply to the carry-forward
+  //    baseline too: flipping to "raw" must not silently drop what they told Pluto.
   const baselines: Partial<Record<CategoryKey, number[]>> = {};
   for (const b of base) baselines[b.spec.key] = b.forecast.map((p) => Math.max(0, p.value));
   const deltas = combineDeltas(adjustments, baselines, horizon);
   const hasFlowPlan = adjustments.some((a) => isFlow(a.category));
-
-  const categories: CategoryProjection[] = base.map(({ spec, y, choice, forecast: raw }) => {
-    const d = deltas[spec.key];
-    const forecast = raw.map(({ value, lo, hi }, i) => {
+  const shifted = (raw: { value: number; lo: number; hi: number }[], d: number[] | undefined) =>
+    raw.map(({ value, lo, hi }, i) => {
       const x = d ? d[i] : 0;
       return { value: Math.max(0, value + x), lo: Math.max(0, lo + x), hi: Math.max(0, hi + x) };
     });
+
+  const categories: CategoryProjection[] = base.map(({ spec, y, choice, forecast: raw, baseline: rawBase }) => {
+    const d = deltas[spec.key];
+    const forecast = shifted(raw, d);
+    const baseline = shifted(rawBase, d);
     const plans = adjustments
       .filter((a) => a.category === spec.key)
       .map((a) => ({ note: a.note, evidence: a.evidence }));
@@ -234,6 +278,7 @@ export function buildProjection(
       kind: spec.kind,
       history: y,
       forecast,
+      baseline,
       model: {
         kind: choice.spec.kind,
         period: choice.spec.period,
@@ -247,20 +292,8 @@ export function buildProjection(
     };
   });
 
-  const at = (key: CategoryKey, k: number) => {
-    const c = categories.find((x) => x.key === key);
-    if (!c) return 0;
-    return k === 0 ? c.history[c.history.length - 1] : c.forecast[k - 1].value;
-  };
-  const summary: Summary = { netWorth: [], surplus: [], assets: [], debt: [] };
-  for (let k = 0; k <= horizon; k++) {
-    const assets = ASSETS.reduce((a, key) => a + at(key, k), 0);
-    const debt = at("card", k);
-    summary.assets.push(assets);
-    summary.debt.push(debt);
-    summary.netWorth.push(assets - debt);
-    summary.surplus.push(at("income", k) - SPENDING.reduce((a, key) => a + at(key, k), 0));
-  }
+  const summary = summaryOf(categories, horizon, "forecast");
+  const baselineSummary = summaryOf(categories, horizon, "baseline");
 
   const live = categories.some((c) => c.model.source === "nemotron");
   return {
@@ -273,6 +306,8 @@ export function buildProjection(
     categories,
     summary,
     adjustments,
+    baselineSummary,
     agent: { live, note: meta.note },
+    stale: meta.stale ?? false,
   };
 }

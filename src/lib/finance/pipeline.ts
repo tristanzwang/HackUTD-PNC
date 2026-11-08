@@ -11,9 +11,18 @@
 import { chooseModel } from "../agents/estimator";
 import type { ForecastAdjustment } from "../chat/types";
 import { buildProjection, heuristicChoice, type Choice, type Projection } from "./projection";
-import { makePersona, type CategoryKey, type Persona } from "./synth";
+import snapshot from "./projection-snapshot.json";
+import { PERSONAS, makePersona, type CategoryKey, type Persona, type PersonaId } from "./synth";
 
-export const HORIZON = 24;
+export const DEFAULT_PERSONA: PersonaId = "tristan";
+
+// Ten years, so a long "what if" scenario is reachable. The scrubber's default
+// visible range stays at 24 (see DEFAULT_SCRUB_MONTHS), so raising this does not
+// change the normal view — long scenarios are reached by scrubbing out.
+export const HORIZON = 120;
+
+/** The scrubber shows this many months by default; scenarios extend it to their run. */
+export const DEFAULT_SCRUB_MONTHS = 24;
 
 // ---------------------------------------------------------------------------
 // the history source
@@ -25,11 +34,13 @@ export const HORIZON = 24;
  * real data exists (transactions rolled up to these categories by month), replace
  * the body of this one function and nothing else in the pipeline changes.
  */
-export async function loadHistory(): Promise<Persona> {
+export async function loadHistory(persona: PersonaId = DEFAULT_PERSONA): Promise<Persona> {
   const now = new Date();
+  const p = PERSONAS[persona];
   return makePersona({
-    id: "student",
-    label: "College student",
+    id: p.id,
+    label: p.label,
+    categories: p.categories,
     nMonths: 36,
     endYear: now.getFullYear(),
     endMonth: now.getMonth(),
@@ -119,30 +130,66 @@ async function chooseAll(persona: Persona) {
   return { choices, note };
 }
 
+
 // ---------------------------------------------------------------------------
 // cached entry point
 // ---------------------------------------------------------------------------
 
-type Chosen = { version: string; choices: Partial<Record<CategoryKey, Choice>>; note?: string };
-let chosen: Chosen | null = null;
-let inflight: Promise<Chosen> | null = null;
+/** The model's forecaster picks for one history, and whether they were baked in at build time. */
+type Chosen = {
+  choices: Partial<Record<CategoryKey, Choice>>;
+  note?: string;
+  /** True when the picks come from the shipped snapshot rather than a model run in this process. */
+  fromSnapshot: boolean;
+};
+
+/**
+ * Picks are the expensive part (a model call per category), so they are cached against a
+ * hash of the history alone: every persona, and every unchanged history, is remembered
+ * separately, and a changed plan never re-spends tokens. A cold start is seeded from the
+ * snapshot made by scripts/build-snapshot.ts, so the first request answers instantly.
+ * Only the snapshot's picks are used; the numbers are always rebuilt locally, so plans
+ * and the persona apply to them like to any other forecast.
+ */
+const chosen = new Map<string, Chosen>();
+const inflight = new Map<string, Promise<Chosen>>();
 /** Finished projections by history + plans, so the same question is never answered twice. */
 const results = new Map<string, Projection>();
 
-/** The model's forecaster picks. Expensive, so cached against the history alone. */
+function seedFromSnapshot() {
+  const s = snapshot as unknown as Pick<Projection, "version" | "categories" | "agent">;
+  if (typeof s.version !== "string" || !Array.isArray(s.categories)) return;
+  const choices: Partial<Record<CategoryKey, Choice>> = {};
+  for (const c of s.categories) {
+    choices[c.key] = {
+      spec: { kind: c.model.kind, period: c.model.period },
+      confidence: c.model.confidence,
+      rationale: c.model.rationale,
+      source: c.model.source,
+      call: c.model.call,
+    };
+  }
+  chosen.set(s.version, { choices, fromSnapshot: true });
+}
+seedFromSnapshot();
+
 async function getChoices(persona: Persona, version: string, force: boolean): Promise<Chosen> {
-  if (chosen && chosen.version === version && !force) return chosen;
-  if (inflight) return inflight; // several callers at once share one set of model calls
-  inflight = (async () => {
+  const hit = chosen.get(version);
+  if (hit && !force) return hit;
+  const pending = inflight.get(version);
+  if (pending) return pending; // several callers at once share one set of model calls
+  const run = (async () => {
     try {
       const { choices, note } = await chooseAll(persona);
-      chosen = { version, choices, note };
-      return chosen;
+      const fresh: Chosen = { choices, note, fromSnapshot: false };
+      chosen.set(version, fresh);
+      return fresh;
     } finally {
-      inflight = null;
+      inflight.delete(version);
     }
   })();
-  return inflight;
+  inflight.set(version, run);
+  return run;
 }
 
 /** A short hash of a set of plans, so a changed plan list is a changed version. */
@@ -158,35 +205,40 @@ function plansKey(plans: ForecastAdjustment[]): string {
 }
 
 /**
- * The projection for the current history and the user's plans. The model's picks are
- * cached against the history, so changing a plan re-runs only the (instant, local)
- * forecast math and never spends model tokens.
+ * The projection for a demo dataset and the user's plans. The model's picks are cached
+ * against the history, so changing a plan re-runs only the (instant, local) forecast
+ * math and never spends model tokens.
  */
 export async function getProjection(
-  opts: { force?: boolean; adjustments?: ForecastAdjustment[] } = {},
+  opts: { force?: boolean; persona?: PersonaId; adjustments?: ForecastAdjustment[] } = {},
 ): Promise<Projection> {
-  const persona = await loadHistory();
+  const persona = await loadHistory(opts.persona);
   const version = versionOf(persona);
   const plans = opts.adjustments ?? [];
   const pk = plansKey(plans);
   const key = `${version}:${pk}`;
 
   if (opts.force) {
-    chosen = null;
-    results.clear();
+    chosen.delete(version);
+    for (const k of results.keys()) if (k.startsWith(`${version}:`)) results.delete(k);
   }
   const hit = results.get(key);
   if (hit) return hit;
 
-  const { choices, note } = await getChoices(persona, version, !!opts.force);
+  const picked = await getChoices(persona, version, !!opts.force);
   const result = buildProjection(
     persona,
     HORIZON,
-    choices,
-    { version: pk ? `${version}+${pk}` : version, generatedAt: new Date().toISOString(), note },
+    picked.choices,
+    {
+      version: pk ? `${version}+${pk}` : version,
+      generatedAt: new Date().toISOString(),
+      note: picked.note,
+      stale: picked.fromSnapshot,
+    },
     plans,
   );
-  if (results.size >= 12) results.delete(results.keys().next().value as string);
+  if (results.size >= 24) results.delete(results.keys().next().value as string);
   results.set(key, result);
   return result;
 }

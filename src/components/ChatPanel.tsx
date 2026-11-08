@@ -1,7 +1,9 @@
 "use client";
 
 import { useEffect, useRef, useState, type FormEvent, type KeyboardEvent } from "react";
-import { Divider, Orb } from "./Ornaments";
+import { sfxReceive, sfxSend } from "@/lib/sfx";
+import { Typewriter, stripWakeWord } from "./FinanceUI";
+import { Divider } from "./Ornaments";
 import type { Companion } from "./useCompanion";
 import { FOCUS, GLASS, PRESS, collapsible, materialize } from "./ui";
 
@@ -21,6 +23,21 @@ const XIcon = () => (
   </svg>
 );
 
+/** Pluto's planet, idly bobbing. */
+function PlutoGlyph({ size }: { size: number }) {
+  return (
+    // eslint-disable-next-line @next/next/no-img-element
+    <img
+      src="/pluto.png"
+      alt=""
+      width={size}
+      height={size}
+      draggable={false}
+      className="pluto-bob object-contain"
+    />
+  );
+}
+
 /**
  * The chat with Pluto. Everything it has learned is one click away and removable,
  * because the person this is about should always be able to see what is known and
@@ -39,10 +56,19 @@ export default function ChatPanel({
   const [draft, setDraft] = useState("");
   const [showLearned, setShowLearned] = useState(false);
   const end = useRef<HTMLDivElement>(null);
+  // messages already in the log when the app opened were read before; new ones type out
+  const [restored] = useState(messages.length);
+  const seen = useRef(messages.length);
 
   useEffect(() => {
     end.current?.scrollIntoView({ block: "end", behavior: "smooth" });
   }, [messages.length, busy, open]);
+
+  // a soft chime when Pluto's reply (or hello) arrives
+  useEffect(() => {
+    if (messages.length > seen.current && messages[messages.length - 1]?.role === "assistant") sfxReceive();
+    seen.current = messages.length;
+  }, [messages]);
 
   useEffect(() => {
     if (!open) return;
@@ -53,9 +79,12 @@ export default function ChatPanel({
 
   const submit = (e?: FormEvent) => {
     e?.preventDefault();
-    const t = draft.trim();
-    if (!t) return;
+    // "Pluto, ..." is fine to say; the wake word is not part of the message
+    const t = stripWakeWord(draft).trim();
+    // Enter must obey the same rule as the Send button: one turn at a time
+    if (!t || busy === "thinking") return;
     setDraft("");
+    sfxSend();
     companion.send(t);
   };
   const onKeyDown = (e: KeyboardEvent<HTMLTextAreaElement>) => {
@@ -81,7 +110,7 @@ export default function ChatPanel({
     >
       {/* header */}
       <div className="flex items-center gap-3 px-5 pb-3 pt-4">
-        <Orb color="#ffffff" size={16} />
+        <PlutoGlyph size={30} />
         <div className="min-w-0 flex-1">
           <h2 className="text-xl font-semibold leading-none tracking-[-0.01em]">Pluto</h2>
           <p className="mt-1 text-sm text-white/45">Here to listen and explain, never to push</p>
@@ -202,7 +231,11 @@ export default function ChatPanel({
                   : "rounded-bl-md border border-white/10 bg-white/[0.07] text-white/90")
               }
             >
-              {m.content}
+              {m.role === "assistant" && i >= restored ? (
+                <Typewriter key={m.content} text={m.content} />
+              ) : (
+                m.content
+              )}
             </p>
           </div>
         ))}
@@ -298,9 +331,7 @@ export function ChatButton({
         FOCUS
       }
     >
-      <svg width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round" aria-hidden>
-        <path d="M21 12a8 8 0 0 1-11.6 7.1L4 20.5l1.4-4.6A8 8 0 1 1 21 12Z" />
-      </svg>
+      <PlutoGlyph size={26} />
       {invite && !open && (
         <span className="absolute right-1 top-1 h-2 w-2 animate-pulse rounded-full bg-white shadow-[0_0_8px_rgba(255,255,255,0.9)]" />
       )}

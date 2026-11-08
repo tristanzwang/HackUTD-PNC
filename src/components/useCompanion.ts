@@ -1,7 +1,10 @@
 "use client";
 
-import { useCallback, useRef, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
+import type { ScenarioIntent } from "@/lib/agents/schemas";
 import { emptyProfile, mergeProfile } from "@/lib/chat/profile";
+import type { Scenario } from "@/lib/finance/scenario";
+import type { CategoryKey, PersonaId } from "@/lib/finance/synth";
 import type {
   ChatBrief,
   ChatMessage,
@@ -54,6 +57,27 @@ async function post<T>(url: string, body: unknown): Promise<T> {
   return json as T;
 }
 
+/** What Pluto can do to the scene besides talk: conjure a what-if, or reorder the orbits. */
+export type SceneActions = {
+  persona: PersonaId;
+  onScenario: (s: Scenario) => void;
+  onPriority: (order: CategoryKey[]) => void;
+};
+
+/** A what-if is a fast, cheap call; if it is slow, just talk instead of making the user wait. */
+const INTENT_TIMEOUT_MS = 12_000;
+
+async function readIntent(message: string): Promise<ScenarioIntent | null> {
+  try {
+    return await Promise.race([
+      post<ScenarioIntent>("/api/scenario", { message }),
+      new Promise<null>((resolve) => setTimeout(() => resolve(null), INTENT_TIMEOUT_MS)),
+    ]);
+  } catch {
+    return null; // the router failing must never stop the conversation
+  }
+}
+
 export type Companion = {
   profile: Profile;
   messages: ChatMessage[];
@@ -79,7 +103,7 @@ export type Companion = {
  * checks any forecast plans against the user's own words, and briefs Pluto for next
  * time. The overseer runs in the background so a reply never waits for it.
  */
-export function useCompanion(): Companion {
+export function useCompanion(actions: SceneActions): Companion {
   // the scene is client-only (no server render), so reading storage here is safe
   const [state, setState] = useState<Stored>(() => load());
   const [busy, setBusy] = useState<Companion["busy"]>("idle");
@@ -91,6 +115,11 @@ export function useCompanion(): Companion {
   const opening = useRef(false);
   const sending = useRef(false);
   const chain = useRef<Promise<void>>(Promise.resolve());
+  // the scene's current persona and handlers, for async work that outlives a render
+  const scene = useRef(actions);
+  useEffect(() => {
+    scene.current = actions;
+  }, [actions]);
 
   const commit = useCallback((next: Stored) => {
     latest.current = next;
@@ -116,6 +145,7 @@ export function useCompanion(): Companion {
             messages: s.messages.slice(-20),
             observations,
             askedAbout,
+            persona: scene.current.persona,
           });
           commit({ ...latest.current, profile: r.profile, brief: r.brief });
           if (r.added.length) setNotice(`Added to your forecast: ${r.added.map((a) => a.note).join("; ")}`);
@@ -144,6 +174,7 @@ export function useCompanion(): Companion {
           action: "brief",
           profile: s.profile,
           messages: s.messages.slice(-12),
+          persona: scene.current.persona,
         });
         s = { ...latest.current, brief };
         commit(s);
@@ -155,11 +186,13 @@ export function useCompanion(): Companion {
           messages: [],
           profile: s.profile,
           brief: s.brief,
+          persona: scene.current.persona,
         });
         const cur = latest.current;
         commit({
           ...cur,
-          messages: [{ role: "assistant", content: r.reply }],
+          // never replace a conversation that has already started while the hello was loading
+          messages: cur.messages.length ? cur.messages : [{ role: "assistant", content: r.reply }],
           profile: mergeProfile(cur.profile, { asked: r.askedAbout || undefined }),
         });
       }
@@ -181,12 +214,27 @@ export function useCompanion(): Companion {
       try {
         commit({ ...latest.current, messages: [...latest.current.messages, { role: "user", content: t }] });
         setBusy("thinking");
+
+        // A what-if or a "protect this first" is an action on the scene, not a chat turn:
+        // do it and answer in Pluto's voice. Everything else (including real plans, which
+        // the overseer must verify) goes through the chat and the overseer as usual.
+        const intent = await readIntent(t);
+        if (intent && intent.kind !== "none") {
+          const cur = latest.current;
+          commit({ ...cur, messages: [...cur.messages, { role: "assistant", content: intent.reply }] });
+          if (intent.kind === "scenario") scene.current.onScenario(intent.scenario);
+          else scene.current.onPriority(intent.order);
+          setBusy("idle");
+          return;
+        }
+
         const s = latest.current;
         const r = await post<{ reply: string; observations: Observation[]; askedAbout: string }>("/api/chat", {
           mode: "reply",
           messages: s.messages.slice(-20),
           profile: s.profile,
           brief: s.brief,
+          persona: scene.current.persona,
         });
         const cur = latest.current;
         commit({

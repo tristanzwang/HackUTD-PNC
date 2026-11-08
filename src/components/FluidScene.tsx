@@ -26,7 +26,10 @@ import {
   ViewTransition,
   clamp01,
   easeInOutCubic,
-  orbitPosition,
+  orbitPhase,
+  orbitRadius,
+  orbitSpeed,
+  orbitTilt,
   spinAxis,
   spinRate,
   systemRadius,
@@ -35,12 +38,15 @@ import { Spring, glide } from "@/lib/spring";
 import { SurfaceSkin } from "@/lib/surface-skin";
 import { Flourish, Orb, PageFrame } from "./Ornaments";
 import { buildFinanceScene, type FinanceScene } from "@/lib/finance/graph-data";
-import { formatUSD } from "@/lib/finance/scene-bridge";
+import { DEFAULT_PRIORITY, INFLATION, formatUSD, orbitOrder } from "@/lib/finance/scene-bridge";
+import type { CategoryKey, PersonaId } from "@/lib/finance/synth";
 import { Scrub } from "@/lib/finance/scrub";
 import { gridToWorldSurface } from "@/lib/units";
 import CategoryPanel from "./CategoryPanel";
 import ChatPanel, { ChatButton } from "./ChatPanel";
-import { AgentStatus, Scrubber } from "./FinanceUI";
+import { AgentStatus, ControlCenter, ScenarioBanner, Scrubber } from "./FinanceUI";
+import { applyScenario, runLength, type Scenario } from "@/lib/finance/scenario";
+import { setVolume as setAudioVolume, setWhoosh, sfxSwitch, sfxUnwarp, sfxWarp, startAmbient } from "@/lib/sfx";
 import SurfacePanel from "./SurfacePanel";
 import { useCompanion } from "./useCompanion";
 import { useProjection } from "./useProjection";
@@ -72,6 +78,16 @@ const GLIDE_STOP = 0.02;
 const FLICK_WINDOW = 90;
 /** How much tighter a planet's dots sit than the same water does in the tank. */
 const ORBIT_PACKING = 0.65;
+// Cursor whoosh: full pace is crossing the screen in about a second. Measured with
+// FluidSim.crowding: points in the sandbox read ~0.1-0.5 (a soft whoosh), a planet's
+// packed dots ~0.9-1.4 (clearly louder), and a clump dragged together reads higher still.
+const WHOOSH_FULL_SPEED = 2.2; // screen widths per second (NDC units)
+const WHOOSH_CROWD_MIN = 0.05;
+const WHOOSH_CROWD_FULL = 1.3;
+const ORBIT_GLIDE_TAU = 0.45; // seconds; how fast a planet eases to a new orbit on reorder
+// How strongly a unit of yearly inflation dissolves a planet's sun-facing dots.
+// Tuned so the effect reads over ~10s of spin without erasing the planet. Tunable.
+const INFLATION_DISSOLVE = 9;
 
 // cursor reach scales with a fluid's particle spacing so sparse fluids stay grabbable
 const splashRadius = (sim: FluidSim) => Math.max(0.16, 1.8 * sim.spacing);
@@ -118,6 +134,18 @@ function getSprite() {
 }
 
 /**
+ * Points carry a per-point opacity in their colour's alpha. The sprite's round edge is
+ * cut out by `alphaTest`, which would also eat points whose opacity is low, so the test
+ * is re-aimed at the sprite's own alpha: faint points stay round and simply fade.
+ */
+function cutOnSpriteAlpha(shader: { fragmentShader: string }) {
+  shader.fragmentShader = shader.fragmentShader.replace(
+    "#include <alphatest_fragment>",
+    "if ( diffuseColor.a < 0.4 * vColor.a ) discard;",
+  );
+}
+
+/**
  * Points share the sim's position buffer directly (no per-frame copy).
  * Lattice links are rebuilt every frame from nearby particle pairs.
  */
@@ -127,12 +155,13 @@ function createBuffers(sim: FluidSim): LatticeBuffers {
 
   const pointGeo = new THREE.BufferGeometry();
   pointGeo.setAttribute("position", new THREE.BufferAttribute(sim.pos, 3));
-  const pointColors = new THREE.BufferAttribute(new Float32Array(n * 3), 3);
+  // RGBA: the fourth channel is each point's opacity (see updateLattice)
+  const pointColors = new THREE.BufferAttribute(new Float32Array(n * 4), 4);
   pointGeo.setAttribute("color", pointColors);
 
   const lineGeo = new THREE.BufferGeometry();
   const linePos = new THREE.BufferAttribute(new Float32Array(maxLinks * 6), 3);
-  const lineCol = new THREE.BufferAttribute(new Float32Array(maxLinks * 6), 3);
+  const lineCol = new THREE.BufferAttribute(new Float32Array(maxLinks * 8), 4);
   linePos.setUsage(THREE.DynamicDrawUsage);
   lineCol.setUsage(THREE.DynamicDrawUsage);
   lineGeo.setAttribute("position", linePos);
@@ -158,7 +187,7 @@ function updateLattice(
   deep: THREE.Color,
   foam: THREE.Color,
   brightness: Float32Array, // per-point multiplier (dims regions where fluids overlap)
-  under: Float32Array, // per-point multiplier (dims points buried below the top surface)
+  under: Float32Array, // per-point opacity (fades points buried below the top surface)
 ) {
   const { vel, pos } = sim;
   const {
@@ -176,18 +205,20 @@ function updateLattice(
   const foamK = 1 - sim.orbitBlend;
   const pc = pointColors.array as Float32Array;
   for (let i = 0; i < sim.count; i++) {
-    const j = i * 3;
+    const j = i * 4;
     if (sim.pinned[i]) {
       c.copy(PIN_COLOR);
     } else {
       const speed = Math.hypot(vel[j], vel[j + 1], vel[j + 2]);
       c.copy(deep)
         .lerp(foam, Math.min(speed / 3.5, 1) * foamK)
-        .multiplyScalar(brightness[i] * under[i]);
+        .multiplyScalar(brightness[i]);
     }
     pc[j] = c.r;
     pc[j + 1] = c.g;
     pc[j + 2] = c.b;
+    // buried points become see-through rather than merely darker
+    pc[j + 3] = under[i];
   }
   pointColors.needsUpdate = true;
   (pointGeo.getAttribute("position") as THREE.BufferAttribute).needsUpdate =
@@ -209,14 +240,18 @@ function updateLattice(
     const dim =
       (bothStuck ? 1 : LINK_DIM) * (1 - STRETCH_FADE * linkStretch[l]);
     for (let e = 0; e < 2; e++) {
-      const p = linkIdx[l * 2 + e] * 3;
+      const idx = linkIdx[l * 2 + e];
+      const p = idx * 3;
+      const q = idx * 4;
       const o = (l * 2 + e) * 3;
+      const oc = (l * 2 + e) * 4;
       lp[o] = pos[p];
       lp[o + 1] = pos[p + 1];
       lp[o + 2] = pos[p + 2];
-      lc[o] = pc[p] * dim;
-      lc[o + 1] = pc[p + 1] * dim;
-      lc[o + 2] = pc[p + 2] * dim;
+      lc[oc] = pc[q] * dim;
+      lc[oc + 1] = pc[q + 1] * dim;
+      lc[oc + 2] = pc[q + 2] * dim;
+      lc[oc + 3] = pc[q + 3]; // a link fades with the points it joins
     }
   }
   linePos.needsUpdate = true;
@@ -239,6 +274,27 @@ function syncDrawState(
 ) {
   geo.setDrawRange(0, sim.count);
   if (mat) mat.size = pointSize(sim);
+}
+
+/**
+ * Inflation: dim a planet's sun-facing dots so they dissolve, then re-brighten as
+ * the ball spins them back round — the sun is inflation. Pure render (it only
+ * scales the per-dot shading in `under`), so it can't destabilise or strip points.
+ * Only acts in the orbit view (orbitBlend > 0), scaled by the category's rate.
+ */
+function dissolveSunward(sim: FluidSim, under: Float32Array, inflation: number) {
+  if (inflation <= 0 || sim.orbitBlend <= 0.05) return;
+  const cx = sim.orbitX, cy = sim.orbitY, cz = sim.orbitZ;
+  const clen = Math.hypot(cx, cy, cz) || 1;
+  const sx = -cx / clen, sy = -cy / clen, sz = -cz / clen; // unit vector toward the sun
+  const reach = sim.ballRadius || 1;
+  const strength = Math.min(0.9, inflation * INFLATION_DISSOLVE) * sim.orbitBlend;
+  const p = sim.pos;
+  for (let i = 0, n = sim.count; i < n; i++) {
+    const progress =
+      ((p[i * 3] - cx) * sx + (p[i * 3 + 1] - cy) * sy + (p[i * 3 + 2] - cz) * sz) / reach;
+    if (progress > 0) under[i] *= 1 - strength * Math.min(progress, 1);
+  }
 }
 
 /**
@@ -286,18 +342,23 @@ function SimDriver({
   overlap,
   overlapDimming,
   scrub,
+  orbitTargets,
 }: {
   fluids: FluidEntry[];
   conductor: ViewTransition;
   overlap: OverlapField;
   overlapDimming: number;
   scrub: Scrub;
+  orbitTargets: number[];
 }) {
   const acc = useRef(0);
-  const live = useRef({ fluids, overlapDimming });
+  const live = useRef({ fluids, overlapDimming, orbitTargets });
   useEffect(() => {
-    live.current = { fluids, overlapDimming };
-  }, [fluids, overlapDimming]);
+    live.current = { fluids, overlapDimming, orbitTargets };
+  }, [fluids, overlapDimming, orbitTargets]);
+  // per-planet eased orbit index + integrated angle, keyed by fluid id, so a
+  // priority change glides the radius without snapping the orbital angle
+  const orbits = useRef(new Map<number, { idx: number; angle: number }>());
   const tmp = useMemo(
     () => ({ orbit: [0, 0, 0] as [number, number, number] }),
     [],
@@ -313,8 +374,13 @@ function SimDriver({
     const { fluids: list } = live.current;
 
     const { gather, launch } = c.advance(d);
-    c.forget(c.p === 0 ? undefined : new Set(list.map((f) => f.id)));
+    const alive = c.p === 0 ? undefined : new Set(list.map((f) => f.id));
+    c.forget(alive);
+    // drop remembered orbits for fluids that are gone (mirrors conductor.forget)
+    if (!alive) orbits.current.clear();
+    else for (const id of orbits.current.keys()) if (!alive.has(id)) orbits.current.delete(id);
 
+    const { orbitTargets: targets } = live.current;
     list.forEach((f, i) => {
       const sim = f.sim;
       sim.orbitBlend = gather;
@@ -338,7 +404,22 @@ function SimDriver({
         sim.orbitZ = home[2];
         sim.unpinAll(); // stuck points would otherwise ride along frozen
       }
-      orbitPosition(i, c.t, tmp.orbit);
+      // ease this planet's orbit index toward its priority target and integrate
+      // the angle, so a reorder glides the radius instead of teleporting it
+      const target = targets[i] ?? i;
+      let ob = orbits.current.get(f.id);
+      if (!ob) {
+        ob = { idx: target, angle: orbitPhase(target) };
+        orbits.current.set(f.id, ob);
+      }
+      ob.idx += (target - ob.idx) * (1 - Math.exp(-d / ORBIT_GLIDE_TAU));
+      ob.angle += orbitSpeed(ob.idx) * d;
+      const rr = orbitRadius(ob.idx);
+      const tl = orbitTilt(ob.idx);
+      const zz = rr * Math.sin(ob.angle);
+      tmp.orbit[0] = rr * Math.cos(ob.angle);
+      tmp.orbit[1] = -zz * Math.sin(tl);
+      tmp.orbit[2] = zz * Math.cos(tl);
       // carry the whole planet rigidly, so orbiting never smears it
       sim.translate(
         home[0] + (tmp.orbit[0] - home[0]) * launch - sim.orbitX,
@@ -371,12 +452,18 @@ function FluidLayer({
   overlap,
   underDimming,
   emphasis,
+  declutter,
+  inflation,
 }: {
   fluid: FluidEntry;
   overlap: OverlapField;
   underDimming: number;
   /** 1 = normal; lower pushes this graph into the background while another is the focus. */
   emphasis: number;
+  /** Hide the point cloud and the links, leaving just the translucent surface plane. */
+  declutter: boolean;
+  /** Per-category yearly inflation; dissolves this planet's sun-facing dots in the orbit view. */
+  inflation: number;
 }) {
   const { sim, color } = fluid;
   const buffers = useMemo(() => createBuffers(sim), [sim]);
@@ -386,7 +473,9 @@ function FluidLayer({
   );
   const under = useMemo(() => new Float32Array(sim.capacity).fill(1), [sim]);
   const fade = useRef(1); // eases toward `emphasis`, so a change of focus is not a cut
+  const declutterFade = useRef(0); // eases toward `declutter`, so dots/lines dissolve smoothly
   const pointsMat = useRef<THREE.PointsMaterial>(null);
+  const lineMat = useRef<THREE.LineBasicMaterial>(null);
   // a translucent skin over the top layer of points, so the graph's shape reads at a glance
   const skin = useMemo(() => new SurfaceSkin(), []);
   useEffect(() => skin.setColor(color), [skin, color]);
@@ -411,6 +500,7 @@ function FluidLayer({
     skin.setEmphasis(fade.current);
     skin.update(sim);
     skin.shade(sim, under, underDimming, fade.current);
+    dissolveSunward(sim, under, inflation);
     updateLattice(
       sim,
       buffers,
@@ -421,6 +511,15 @@ function FluidLayer({
       under,
     );
     syncDrawState(buffers.pointGeo, pointsMat.current, sim);
+    // declutter: dissolve the dots (shrink + fade) and the links, leaving the
+    // clean surface plane. Eased so the clutter animates away rather than popping.
+    declutterFade.current += ((declutter ? 1 : 0) - declutterFade.current) * 0.1;
+    const vis = 1 - declutterFade.current;
+    if (pointsMat.current) {
+      pointsMat.current.size = pointSize(sim) * vis;
+      pointsMat.current.opacity = vis;
+    }
+    if (lineMat.current) lineMat.current.opacity = 0.55 * vis;
   });
 
   return (
@@ -433,12 +532,14 @@ function FluidLayer({
           sizeAttenuation
           vertexColors
           map={getSprite()}
-          alphaTest={0.4}
           transparent
+          onBeforeCompile={cutOnSpriteAlpha}
+          customProgramCacheKey={() => "sprite-alpha-cut"}
         />
       </points>
       <lineSegments geometry={buffers.lineGeo} frustumCulled={false}>
         <lineBasicMaterial
+          ref={lineMat}
           vertexColors
           transparent
           opacity={0.55}
@@ -810,6 +911,8 @@ function Interaction({
     }
 
     // ---- cursor splash (only the first fluid the cursor touches) ----
+    let whooshLevel = 0;
+    let whooshPitch = 0;
     if (!s.grabbing && s.inside && !s.dragging) {
       tmp.ray.setFromCamera(s.ndc, camera);
       const o = tmp.ray.ray.origin;
@@ -839,8 +942,18 @@ function Interaction({
           [ix, iy, iz],
           0.25,
         );
+        // a whoosh for moving through the points: louder the faster you go and the more
+        // tightly the points are squeezed together where the cursor is
+        if (hit) {
+          const pace = Math.min(speed / Math.max(dt, 1 / 120) / WHOOSH_FULL_SPEED, 1);
+          const crowd = target.sim.crowding(hit, splashRadius(target.sim) * 1.6);
+          const squeeze = clamp01((crowd - WHOOSH_CROWD_MIN) / (WHOOSH_CROWD_FULL - WHOOSH_CROWD_MIN));
+          whooshLevel = Math.sqrt(pace) * squeeze;
+          whooshPitch = pace;
+        }
       }
     }
+    setWhoosh(whooshLevel, whooshPitch);
     if (cursor.current) {
       cursor.current.visible = !!hit;
       if (hit) {
@@ -984,6 +1097,10 @@ function SettingsMenu(props: {
   onOverlapDimming: (v: number) => void;
   underDimming: number;
   onUnderDimming: (v: number) => void;
+  declutter: boolean;
+  onDeclutter: (v: boolean) => void;
+  volume: number;
+  onVolume: (v: number) => void;
   onReset: () => void;
 }) {
   const [open, setOpen] = useState(false);
@@ -1032,6 +1149,11 @@ function SettingsMenu(props: {
         <div className="min-h-0 overflow-hidden">
           <div className="space-y-3.5 px-4 pb-3 pt-4">
             <Slider
+              label="Sound"
+              value={props.volume}
+              onChange={props.onVolume}
+            />
+            <Slider
               label="Depth dimming"
               value={props.dimming}
               onChange={props.onDimming}
@@ -1047,11 +1169,37 @@ function SettingsMenu(props: {
               onChange={props.onUnderDimming}
             />
             <div className={collapsible(props.inGraph)} inert={!props.inGraph}>
-              <div className="min-h-0 overflow-hidden">
+              <div className="min-h-0 space-y-3 overflow-hidden">
+                <div className="flex items-center justify-between pt-0.5">
+                  <span className="text-base text-white/85">Declutter</span>
+                  <button
+                    role="switch"
+                    aria-checked={props.declutter}
+                    aria-label="Hide sandbox chrome"
+                    onClick={() => props.onDeclutter(!props.declutter)}
+                    className={
+                      "relative h-6 w-11 rounded-full transition-colors duration-200 " +
+                      (props.declutter ? "bg-sky-400/80" : "bg-white/15") +
+                      " " +
+                      PRESS +
+                      " " +
+                      FOCUS
+                    }
+                  >
+                    <span
+                      aria-hidden
+                      className={
+                        "absolute left-0.5 top-1/2 h-5 w-5 -translate-y-1/2 rounded-full bg-white shadow " +
+                        "transition-transform duration-200 ease-[cubic-bezier(0.32,0.72,0,1)] " +
+                        (props.declutter ? "translate-x-5" : "translate-x-0")
+                      }
+                    />
+                  </button>
+                </div>
                 <button
                   onClick={props.onReset}
                   className={
-                    "mt-0.5 w-full rounded-full px-4 py-1.5 text-base font-semibold " +
+                    "w-full rounded-full px-4 py-1.5 text-base font-semibold " +
                     "tracking-[0.02em] text-white " +
                     CHIP +
                     " " +
@@ -1196,21 +1344,146 @@ export default function FluidScene({ onReady }: { onReady?: () => void }) {
   const [overlapDimming, setOverlapDimming] = useState(DEFAULT_OVERLAP_DIMMING);
   const [underDimming, setUnderDimming] = useState(DEFAULT_UNDER_DIMMING);
   const [view, setView] = useState<View>("graph");
+  const changeView = (v: View) => {
+    if (v === view) return;
+    sfxSwitch(v === "solar");
+    setView(v);
+  };
+  const [declutter, setDeclutter] = useState(false); // hide sandbox chrome for a clean view
+  const [volume, setVolume] = useState(0.35); // master audio volume (Settings)
   const [selectedId, setSelectedId] = useState(fluids[0].id);
   const [panelOpen, setPanelOpen] = useState(false); // the sidebar opens from the legend
   const overlap = useMemo(() => new OverlapField(), []);
   const conductor = useMemo(() => new ViewTransition(), []);
   const inGraph = view === "graph";
+  const sandboxClean = declutter && inGraph; // decluttered sandbox: decorative chrome hidden
 
   // ---- the user's finances: read, forecast, and turned into graphs and planets ----
-  const companion = useCompanion();
+  const [persona, setPersona] = useState<PersonaId>("tristan"); // demo dataset toggle
+  // Pluto's two ways of acting on the scene. They need the projection that Pluto's own
+  // plans feed into, so they reach it through refs that are filled in below.
+  const scenarioRef = useRef<(s: Scenario) => void>(() => {});
+  const priorityRef = useRef<(order: CategoryKey[]) => void>(() => {});
+  const sceneActions = useMemo(
+    () => ({
+      persona,
+      onScenario: (s: Scenario) => scenarioRef.current(s),
+      onPriority: (order: CategoryKey[]) => priorityRef.current(order),
+    }),
+    [persona],
+  );
+  const companion = useCompanion(sceneActions);
   // what the user has told Pluto (their plans) is part of the forecast
-  const projection = useProjection(companion.profile.adjustments);
+  const projection = useProjection(companion.profile.adjustments, persona);
+  const realData = projection.data;
+  // A hypothetical is kept as the scenario itself and re-applied to whatever the real
+  // projection currently is, so a new plan from Pluto or a dataset reload can never
+  // leave the overlay built on stale numbers. The real projection is never touched.
+  const [scenario, setScenario] = useState<Scenario | null>(null);
+  const overlay = useMemo(() => {
+    if (!realData || !scenario) return null;
+    const projection = applyScenario(realData, scenario);
+    const run = runLength(realData, scenario);
+    const delta = projection.summary.netWorth[run] - realData.summary.netWorth[run];
+    return { projection, label: scenario.label, delta, run };
+  }, [realData, scenario]);
+  const activeData = overlay ? overlay.projection : realData;
   const scene = useMemo(
-    () => (projection.data ? buildFinanceScene(projection.data) : null),
-    [projection.data],
+    // a scenario overlay is sized against the real projection, so normal planets
+    // keep their size and only the changed category balloons
+    () => (activeData ? buildFinanceScene(activeData, realData ?? activeData) : null),
+    [activeData, realData],
   );
   const scrub = useMemo(() => new Scrub(), []);
+  const DEFAULT_SCRUB_MONTHS = 24; // the scrubber's default range; scenarios extend it to their run
+  const savedScrub = useRef(0); // scrub position to restore when leaving a scenario
+
+  const enterScenario = (s: Scenario) => {
+    if (!realData) return;
+    // the first hypothetical remembers where the user was; a second one keeps that spot
+    if (!scenario) savedScrub.current = scrub.get();
+    setScenario(s);
+    scrub.set(runLength(realData, s)); // jump to the end of the run so the effect is visible at once
+    sfxWarp();
+  };
+  const exitScenario = () => {
+    if (!scenario) return;
+    scrub.set(savedScrub.current); // restore the previous scrub position
+    setScenario(null);
+    sfxUnwarp();
+  };
+  const switchPersona = (id: PersonaId) => {
+    if (id === persona) return;
+    if (scenario) {
+      scrub.set(savedScrub.current);
+      setScenario(null); // a scenario belongs to the old dataset; drop it
+    }
+    setPersona(id);
+  };
+  // Escape also leaves the hypothetical
+  useEffect(() => {
+    if (!scenario) return;
+    const onKey = (e: globalThis.KeyboardEvent) => {
+      if (e.key === "Escape") {
+        scrub.set(savedScrub.current);
+        setScenario(null);
+        sfxUnwarp();
+      }
+    };
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, [scenario, scrub]);
+  useEffect(() => {
+    scenarioRef.current = enterScenario;
+  });
+
+  // audio: push the volume setting to the engine, and start the ambient bed on
+  // the first user gesture (browsers won't let it autoplay before then)
+  useEffect(() => {
+    setAudioVolume(volume);
+  }, [volume]);
+  useEffect(() => {
+    const go = () => {
+      startAmbient();
+      setAudioVolume(volume);
+    };
+    window.addEventListener("pointerdown", go, { once: true });
+    return () => window.removeEventListener("pointerdown", go);
+  }, [volume]);
+  // what the user protects first; orbit radius follows this (React state only)
+  const [priority, setPriority] = useState<CategoryKey[]>(DEFAULT_PRIORITY);
+  // target orbit index per fluid (by array position), from the current priority
+  const orbitTargets = useMemo(() => {
+    const keys = fluids.map((f) => f.data?.key).filter(Boolean) as CategoryKey[];
+    const order = orbitOrder(keys, priority);
+    return fluids.map((f, i) => (f.data ? order.get(f.data.key) ?? i : i));
+  }, [fluids, priority]);
+  // Pluto can set the whole order; dedupe and backfill any it left out so all
+  // eight planets are always present.
+  const setPriorityOrder = (order: CategoryKey[]) =>
+    setPriority((prev) => {
+      const seen = new Set<CategoryKey>();
+      const next = [...order, ...prev].filter((k) => prev.includes(k) && !seen.has(k) && seen.add(k));
+      return next.length === prev.length ? next : prev;
+    });
+  useEffect(() => {
+    priorityRef.current = setPriorityOrder;
+  });
+  const movePriority = (key: CategoryKey, dir: -1 | 1) =>
+    setPriority((prev) => {
+      const i = prev.indexOf(key);
+      const j = i + dir;
+      if (i < 0 || j < 0 || j >= prev.length) return prev;
+      const next = [...prev];
+      [next[i], next[j]] = [next[j], next[i]];
+      return next;
+    });
+  // each planet's actual colour (the legend's, which the user can change), by category
+  const planetColors = useMemo(() => {
+    const out: Partial<Record<CategoryKey, string>> = {};
+    for (const f of fluids) if (f.data) out[f.data.key] = f.color;
+    return out;
+  }, [fluids]);
   const fluidsRef = useRef(fluids);
   const dataVersion = useRef<string | null>(null); // the forecast the fluids' numbers come from
   const surfaceVersion = useRef<string | null>(null); // the forecast their pools were filled from
@@ -1353,6 +1626,7 @@ export default function FluidScene({ onReady }: { onReady?: () => void }) {
             overlap={overlap}
             overlapDimming={overlapDimming}
             scrub={scrub}
+            orbitTargets={orbitTargets}
           />
           <Tank conductor={conductor} scene={scene} />
           <SolarSystem conductor={conductor} count={fluids.length} />
@@ -1364,6 +1638,8 @@ export default function FluidScene({ onReady }: { onReady?: () => void }) {
               overlap={overlap}
               underDimming={underDimming}
               emphasis={focusId !== null && f.id !== focusId ? 0.22 : 1}
+              declutter={sandboxClean}
+              inflation={f.data ? INFLATION[f.data.key] ?? 0 : 0}
             />
           ))}
           <Interaction
@@ -1379,9 +1655,34 @@ export default function FluidScene({ onReady }: { onReady?: () => void }) {
         aria-hidden
         className="pointer-events-none absolute inset-0 bg-[radial-gradient(ellipse_at_center,transparent_55%,rgba(6,3,20,0.55)_100%)]"
       />
+      {/* a distinct tint while a hypothetical scenario is overlaid */}
+      <div
+        aria-hidden
+        className={
+          "pointer-events-none absolute inset-0 bg-fuchsia-600/15 transition-opacity duration-500 " +
+          (overlay ? "opacity-100" : "opacity-0")
+        }
+      />
 
       <PageFrame />
-      <ViewTabs view={view} onChange={setView} />
+      <ViewTabs view={view} onChange={changeView} />
+
+      {/* inconspicuous demo-only dataset toggle, tucked at the very top */}
+      <div className="rise absolute left-1/2 top-1 z-10 flex -translate-x-1/2 select-none items-center gap-1.5 text-[0.62rem] tracking-wide text-white/35">
+        {(["tristan", "yuva"] as PersonaId[]).map((id) => (
+          <button
+            key={id}
+            onClick={() => switchPersona(id)}
+            aria-pressed={persona === id}
+            className={
+              (persona === id ? "text-white/70" : "text-white/35 hover:text-white/55") + " " + FOCUS
+            }
+          >
+            {id === "tristan" ? "Tristan" : "Yuva"}
+          </button>
+        ))}
+        <span className="ml-1 uppercase tracking-[0.18em] text-white/20">demo only</span>
+      </div>
 
       <SettingsMenu
         inGraph={inGraph}
@@ -1391,6 +1692,10 @@ export default function FluidScene({ onReady }: { onReady?: () => void }) {
         onOverlapDimming={setOverlapDimming}
         underDimming={underDimming}
         onUnderDimming={setUnderDimming}
+        declutter={declutter}
+        onDeclutter={setDeclutter}
+        volume={volume}
+        onVolume={setVolume}
         onReset={() => fluids.forEach((f) => f.sim.reset())}
       />
 
@@ -1407,6 +1712,7 @@ export default function FluidScene({ onReady }: { onReady?: () => void }) {
         <CategoryPanel
           open={panelOpen}
           graph={selected.data}
+          color={selected.color}
           scene={scene}
           scrub={scrub}
           onClose={closePanel}
@@ -1424,7 +1730,25 @@ export default function FluidScene({ onReady }: { onReady?: () => void }) {
         />
       )}
 
-      {scene && <Scrubber scrub={scrub} scene={scene} show={!inGraph} />}
+      {scene && (
+        <Scrubber
+          scrub={scrub}
+          scene={scene}
+          show={!inGraph}
+          scrubMax={overlay ? overlay.run : DEFAULT_SCRUB_MONTHS}
+        />
+      )}
+      {scene && (
+        <ControlCenter
+          scrub={scrub}
+          scene={scene}
+          show={!inGraph}
+          priority={priority}
+          colors={planetColors}
+          onMove={movePriority}
+          tuck={chatOpen}
+        />
+      )}
       <div className="absolute bottom-5 left-5 flex items-center gap-2">
         <ChatButton
           open={chatOpen}
@@ -1438,6 +1762,14 @@ export default function FluidScene({ onReady }: { onReady?: () => void }) {
         companion={companion}
         onClose={() => setChatOpen(false)}
       />
+      {overlay && (
+        <ScenarioBanner
+          label={overlay.label}
+          delta={overlay.delta}
+          show={true}
+          onExit={exitScenario}
+        />
+      )}
     </div>
   );
 }

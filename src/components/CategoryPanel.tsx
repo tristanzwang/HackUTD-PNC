@@ -5,6 +5,7 @@ import type { FinanceGraph, FinanceScene } from "@/lib/finance/graph-data";
 import type { ModelInfo } from "@/lib/finance/projection";
 import { formatUSD } from "@/lib/finance/scene-bridge";
 import type { Scrub } from "@/lib/finance/scrub";
+import { Typewriter } from "./FinanceUI";
 import { Divider, Orb } from "./Ornaments";
 import { FOCUS, GLASS, PRESS, materialize } from "./ui";
 
@@ -34,12 +35,15 @@ const BAD = "text-rose-300";
 export default function CategoryPanel({
   open,
   graph,
+  color,
   scene,
   scrub,
   onClose,
 }: {
   open: boolean;
   graph: FinanceGraph;
+  /** The planet's actual colour: the legend's, which the user can change. */
+  color: string;
   scene: FinanceScene;
   scrub: Scrub;
   onClose: () => void;
@@ -77,7 +81,7 @@ export default function CategoryPanel({
       }
     >
       <div className="relative flex items-center gap-3">
-        <Orb color={graph.color} size={22} />
+        <Orb color={color} size={22} />
         <div className="min-w-0 flex-1">
           <h2 className="text-xl font-semibold leading-none tracking-[-0.01em]">{cat.label}</h2>
           <p className="mt-1 text-sm text-white/45">{KIND_LABEL[cat.kind]}</p>
@@ -141,7 +145,12 @@ export default function CategoryPanel({
           title={m.rationale}
           className="mt-1.5 line-clamp-4 text-[0.98rem] leading-snug text-white/65"
         >
-          {m.rationale}
+          {/* type Nemotron's rationale out the first time this panel is opened */}
+          {open && m.source === "nemotron" ? (
+            <Typewriter key={m.rationale} text={m.rationale} />
+          ) : (
+            m.rationale
+          )}
         </p>
         <div className="mt-2.5 flex items-center gap-2 text-sm text-white/45">
           Confidence

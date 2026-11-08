@@ -33,6 +33,8 @@ export const PLANET_MIN = 0.14;
 /** Months of history drawn to the left of "today". */
 export const HISTORY_WINDOW = 24;
 
+export type ForecastMode = "interpreted" | "raw";
+
 export type FinanceGraph = SceneCategory & {
   cat: CategoryProjection;
   /** The ribbon, in grid units (0-100 on x and z, height on the y axis). */
@@ -59,6 +61,9 @@ export type FinanceScene = {
   monthAt: (k: number) => string;
   /** Net worth, surplus, assets and debt for k = 0 (today) .. horizon. */
   summary: Summary;
+  /** "interpreted" = per-category model picks; "raw" = carry-forward. Drives radiusAt. */
+  mode: ForecastMode;
+  setMode: (m: ForecastMode) => void;
 };
 
 const lerp = (a: number, b: number, t: number) => a + (b - a) * t;
@@ -74,31 +79,48 @@ function sample(a: number[], i: number) {
 /** "Nov 2026" -> "Nov ’26" */
 const shortMonth = (m: string) => m.replace(/ \d\d(\d\d)$/, " ’$1");
 
-export function buildFinanceScene(p: Projection): FinanceScene {
+/**
+ * The height/size normalisation: the tallest range (`largest`) and the biggest
+ * body today-or-later (`biggest`). Drawn from `scaleRef` so a "what if" overlay
+ * can be sized against the REAL projection — otherwise one runaway category (a
+ * decade of gambling debt) collapses every other planet to a speck.
+ */
+function sceneScale(scaleRef: Projection, hist: number, today: number) {
+  let largest = 0;
+  let biggest = 0;
+  for (const c of scaleRef.categories) {
+    const h = c.history.slice(-hist);
+    const hi = [...h, ...c.forecast.map((f) => f.hi)];
+    for (const v of hi) largest = Math.max(largest, v);
+    const mid = [...h, ...c.forecast.map((f) => f.value)];
+    for (const v of mid.slice(today)) biggest = Math.max(biggest, v);
+  }
+  return { largest: largest || 1, biggest: biggest || 1 };
+}
+
+export function buildFinanceScene(p: Projection, scaleRef: Projection = p): FinanceScene {
   const hist = Math.min(HISTORY_WINDOW, p.months.length);
   const N = hist + p.horizon;
   const today = hist - 1; // index of the last history month along the time axis
 
+  // flipped by the Raw/Interpreted control; radiusAt below reads it live each frame
+  let mode: ForecastMode = "interpreted";
+
   // dollars along the whole time axis, per category
-  const series = new Map<string, { mid: number[]; lo: number[]; hi: number[] }>();
+  const series = new Map<string, { mid: number[]; lo: number[]; hi: number[]; base: number[] }>();
   for (const c of p.categories) {
     const h = c.history.slice(-hist);
     series.set(c.key, {
       mid: [...h, ...c.forecast.map((f) => f.value)],
       lo: [...h, ...c.forecast.map((f) => f.lo)],
       hi: [...h, ...c.forecast.map((f) => f.hi)],
+      base: [...h, ...c.baseline.map((f) => f.value)],
     });
   }
 
-  // heights are shared across graphs, so sizes stay comparable between planets
-  let largest = 0;
-  for (const s of series.values()) for (const v of s.hi) largest = Math.max(largest, v);
-  largest = largest || 1;
-
-  // the biggest any category gets, today or in the forecast, is the full-size planet
-  let biggest = 0;
-  for (const s of series.values()) for (const v of s.mid.slice(today)) biggest = Math.max(biggest, v);
-  biggest = biggest || 1;
+  // sizes are shared across graphs and (for an overlay) against the real scene,
+  // so a scenario shows its one category ballooning without shrinking the rest
+  const { largest, biggest } = sceneScale(scaleRef, hist, today);
 
   const latest: Record<string, number> = {};
   for (const c of p.categories) latest[c.key] = c.history[c.history.length - 1];
@@ -112,6 +134,7 @@ export function buildFinanceScene(p: Projection): FinanceScene {
     const hHi = s.hi.map((v) => heightForAmount(v, largest));
     // everything from today onward, so index k = months from now
     const midNow = s.mid.slice(today);
+    const baseNow = s.base.slice(today);
     const loNow = s.lo.slice(today);
     const hiNow = s.hi.slice(today);
 
@@ -138,7 +161,8 @@ export function buildFinanceScene(p: Projection): FinanceScene {
       amountAt: (k) => sample(midNow, k),
       rangeAt: (k) => ({ lo: sample(loNow, k), hi: sample(hiNow, k) }),
       radiusAt: (k) => {
-        const r = PLANET_MAX * Math.cbrt(Math.max(sample(midNow, k), 0) / biggest);
+        const pick = mode === "raw" ? baseNow : midNow;
+        const r = PLANET_MAX * Math.cbrt(Math.max(sample(pick, k), 0) / biggest);
         return Math.min(Math.max(r, PLANET_MIN), PLANET_MAX);
       },
     });
@@ -157,6 +181,12 @@ export function buildFinanceScene(p: Projection): FinanceScene {
     todayFraction: today / (N - 1),
     labels: { x, y, z },
     summary: p.summary,
+    get mode() {
+      return mode;
+    },
+    setMode: (m) => {
+      mode = m;
+    },
     monthAt: (k) => {
       const i = Math.round(k);
       return i <= 0 ? p.months[p.months.length - 1] : p.futureMonths[Math.min(i, p.horizon) - 1];
