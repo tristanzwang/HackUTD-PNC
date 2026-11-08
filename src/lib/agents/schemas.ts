@@ -12,7 +12,8 @@ export const ModelChoice = z.object({
   /** 0..1. Low confidence should route the category to the deep tier. */
   confidence: z.number().min(0).max(1),
   /** One sentence, in plain language, naming the pattern it saw. */
-  rationale: z.string().min(1).max(400),
+  // Generous on purpose: the prompt asks for two short sentences, but a long answer must not fail the call.
+  rationale: z.string().min(1).max(1200),
   /**
    * Display only - never fed to the fitter. Kept permissive on purpose: an
    * earlier version capped this at 0-11 and the model answered with data

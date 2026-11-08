@@ -29,7 +29,11 @@ function makeLabel(text: string, color: string, scale = 1, italic = false): Labe
   const tex = new THREE.CanvasTexture(cv);
   const draw = () => {
     g.clearRect(0, 0, cv.width, cv.height);
-    g.font = `${italic ? "italic " : ""}600 76px ${serifFamily()}`;
+    const family = serifFamily();
+    g.font = `${italic ? "italic " : ""}600 76px ${family}`;
+    // longer labels (months, dollars) shrink to fit the sprite instead of clipping
+    const w = g.measureText(text).width;
+    if (w > 228) g.font = `${italic ? "italic " : ""}600 ${Math.floor((76 * 228) / w)}px ${family}`;
     g.textAlign = "center";
     g.textBaseline = "middle";
     g.shadowColor = "rgba(190,210,255,0.55)"; // a faint starlight glow
@@ -90,7 +94,21 @@ function makeMarkerTexture(kind: "star" | "ring") {
  */
 export function createCoordinateGrid(
   box: Box,
-  { divisions = 10, labelEvery = 20, units = 100 } = {},
+  {
+    divisions = 10,
+    labelEvery = 20,
+    units = 100,
+    labels: custom,
+    today,
+  }: {
+    divisions?: number;
+    labelEvery?: number;
+    units?: number;
+    /** Replace the 0-100 tick numbers; one string per tick ("" = no label). */
+    labels?: { x?: string[]; y?: string[]; z?: string[] };
+    /** Draw a "today" marker this far (0-1) along the graph's x axis. */
+    today?: number;
+  } = {},
 ) {
   const group = new THREE.Group();
   // every material, with the opacity it has when the grid is fully shown, so the
@@ -212,11 +230,30 @@ export function createCoordinateGrid(
     group.add(s);
     labels.push(s);
   };
-  for (const t of tickFractions) {
-    const text = String(Math.round(t * units));
-    put(text, lerp(box.minX, box.maxX, t), ly, box.minZ - off);
-    put(text, box.minX - off, ly, lerp(box.minZ, box.maxZ, t));
-    if (t > 0) put(text, box.minX - off, lerp(box.minY, box.maxY, t), box.minZ - off);
+  // the axes are swapped: world X carries the graph's z ticks, world Z its x ticks
+  tickFractions.forEach((t, i) => {
+    const num = String(Math.round(t * units));
+    const zText = custom?.z?.[i] ?? num;
+    const xText = custom?.x?.[i] ?? num;
+    const yText = custom?.y?.[i] ?? num;
+    if (zText) put(zText, lerp(box.minX, box.maxX, t), ly, box.minZ - off);
+    if (xText) put(xText, box.minX - off, ly, lerp(box.minZ, box.maxZ, t));
+    if (t > 0 && yText) put(yText, box.minX - off, lerp(box.minY, box.maxY, t), box.minZ - off);
+  });
+
+  // "today": a line across the floor and up the side wall, where history ends and the forecast begins
+  if (today !== undefined) {
+    const zt = lerp(box.minZ, box.maxZ, today);
+    group.add(
+      new THREE.LineSegments(
+        lineGeometry([
+          box.minX, box.minY, zt, box.maxX, box.minY, zt,
+          box.minX, box.minY, zt, box.minX, box.maxY, zt,
+        ]),
+        track(new THREE.LineBasicMaterial({ color: INK, transparent: true, opacity: 0.5 })),
+      ),
+    );
+    put("today", box.minX - off - 0.1, box.maxY * 0.5, zt, 1.1, true);
   }
   // the axes are swapped: the graph's z runs along world X, and its x along world Z
   put("z", box.maxX + 0.17, ly, box.minZ - off, 1.5, true);
@@ -236,6 +273,17 @@ export function createCoordinateGrid(
 
   return {
     group,
+    /** Free the geometries, materials and label textures (call when the grid is replaced). */
+    dispose() {
+      group.traverse((o) => {
+        const m = o as THREE.Mesh;
+        m.geometry?.dispose();
+      });
+      for (const f of fades) {
+        (f.mat as THREE.SpriteMaterial).map?.dispose();
+        f.mat.dispose();
+      }
+    },
     /** Fade the whole grid (1 = fully shown, 0 = gone). */
     setOpacity(k: number) {
       group.visible = k > 0.002;

@@ -43,7 +43,9 @@ How to read the statistics you are given:
 
 Set confidence to reflect the evidence, not your enthusiasm. Weak or
 conflicting statistics mean confidence below 0.5.
-Never output a forecast or a dollar amount. Pick the model only.`;
+Never output a forecast or a dollar amount. Pick the model only.
+Keep "rationale" to at most two short sentences, and make sure it describes the
+model you actually chose.`;
 
 export async function chooseModel(input: {
   label: string;

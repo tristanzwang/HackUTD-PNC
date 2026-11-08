@@ -637,6 +637,12 @@ export class FluidSim {
   }
 
   /** Radius of the ball this fluid settles into around a gravity point. */
+  /** The ball's radius if its points sat at their tank spacing (packing 1). */
+  get tankBallRadius() {
+    const volume = this.count * this.tankSpacing ** 3 * SETTLED_VOLUME;
+    return Math.cbrt((volume * 3) / (4 * Math.PI));
+  }
+
   get ballRadius() {
     const volume = this.count * this.spacing ** 3 * SETTLED_VOLUME;
     return Math.cbrt((volume * 3) / (4 * Math.PI));

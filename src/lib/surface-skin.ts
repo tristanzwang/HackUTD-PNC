@@ -27,6 +27,7 @@ export class SurfaceSkin {
   private index = new Uint32Array(0);
   private heights = new Float32Array(0); // smoothed surface height per vertex, from the last update
   private shown = 0; // 1 = skin fully in the graph view, 0 = gone (planet)
+  private emphasis = 1; // 1 = normal; lower pushes this graph into the background
 
   constructor() {
     this.material = new THREE.MeshLambertMaterial({
@@ -41,6 +42,11 @@ export class SurfaceSkin {
     this.mesh = new THREE.Mesh(new THREE.BufferGeometry(), this.material);
     this.mesh.frustumCulled = false;
     this.mesh.visible = false;
+  }
+
+  /** Fade the skin (and, via shade(), the points) when another graph is the focus. */
+  setEmphasis(e: number) {
+    this.emphasis = e;
   }
 
   setColor(color: string) {
@@ -81,7 +87,7 @@ export class SurfaceSkin {
     // gone by the time the graph has started to ball up
     const k = 1 - Math.min(sim.orbitBlend * 4, 1);
     this.shown = k;
-    this.material.opacity = OPACITY * k;
+    this.material.opacity = OPACITY * k * this.emphasis;
     this.mesh.visible = k > 0.01 && sim.count > 0;
     if (!this.mesh.visible) return;
     if (Math.abs(sim.tankSpacing - this.spacing) > 1e-5) this.build(sim.tankSpacing);
@@ -175,12 +181,13 @@ export class SurfaceSkin {
   /**
    * Fill `out` with a brightness multiplier per point: 1 for points in the top
    * layer, falling toward `1 - strength` for points buried deeper below the
-   * surface. Call after update(). Planets (no skin) are left at 1.
+   * surface. `emphasis` scales everything (a graph pushed into the background).
+   * Call after update(). Planets (no skin) are left at `emphasis`.
    */
-  shade(sim: FluidSim, out: Float32Array, strength: number) {
+  shade(sim: FluidSim, out: Float32Array, strength: number, emphasis = 1) {
     const amount = strength * this.shown;
     if (amount <= 0.001 || this.heights.length === 0) {
-      out.fill(1, 0, sim.count);
+      out.fill(emphasis, 0, sim.count);
       return;
     }
     const { n, cell, heights } = this;
@@ -192,11 +199,11 @@ export class SurfaceSkin {
       const j = Math.min(Math.max(Math.round((p[q * 3 + 2] - TANK.minZ) / cell), 0), n);
       const surface = heights[j * (n + 1) + i];
       if (surface === -Infinity) {
-        out[q] = 1;
+        out[q] = emphasis;
         continue;
       }
       const t = Math.min(Math.max((surface - p[q * 3 + 1] - top) / span, 0), 1);
-      out[q] = 1 - amount * 0.94 * (t * t * (3 - 2 * t));
+      out[q] = emphasis * (1 - amount * 0.94 * (t * t * (3 - 2 * t)));
     }
   }
 
