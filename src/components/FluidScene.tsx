@@ -39,11 +39,14 @@ import { SurfaceSkin } from "@/lib/surface-skin";
 import { Flourish, Orb, PageFrame } from "./Ornaments";
 import { buildFinanceScene, type FinanceScene } from "@/lib/finance/graph-data";
 import { DEFAULT_PRIORITY, INFLATION, formatUSD, orbitOrder } from "@/lib/finance/scene-bridge";
-import type { CategoryKey } from "@/lib/finance/synth";
+import type { CategoryKey, PersonaId } from "@/lib/finance/synth";
 import { Scrub } from "@/lib/finance/scrub";
 import { gridToWorldSurface } from "@/lib/units";
 import CategoryPanel from "./CategoryPanel";
-import { AgentStatus, ControlCenter, Scrubber } from "./FinanceUI";
+import { AgentStatus, ControlCenter, PlutoChat, ScenarioBanner, Scrubber } from "./FinanceUI";
+import { applyScenario, runLength, type Scenario } from "@/lib/finance/scenario";
+import type { Projection } from "@/lib/finance/projection";
+import { setVolume as setAudioVolume, sfxUnwarp, sfxWarp, startAmbient } from "@/lib/sfx";
 import SurfacePanel from "./SurfacePanel";
 import { useProjection } from "./useProjection";
 import { CHIP, FOCUS, GLASS, PRESS, collapsible } from "./ui";
@@ -1054,6 +1057,8 @@ function SettingsMenu(props: {
   onUnderDimming: (v: number) => void;
   declutter: boolean;
   onDeclutter: (v: boolean) => void;
+  volume: number;
+  onVolume: (v: number) => void;
   onReset: () => void;
 }) {
   const [open, setOpen] = useState(false);
@@ -1101,6 +1106,11 @@ function SettingsMenu(props: {
       <div id={panelId} className={collapsible(open)} inert={!open}>
         <div className="min-h-0 overflow-hidden">
           <div className="space-y-3.5 px-4 pb-3 pt-4">
+            <Slider
+              label="Sound"
+              value={props.volume}
+              onChange={props.onVolume}
+            />
             <Slider
               label="Depth dimming"
               value={props.dimming}
@@ -1277,6 +1287,7 @@ export default function FluidScene() {
   const [underDimming, setUnderDimming] = useState(DEFAULT_UNDER_DIMMING);
   const [view, setView] = useState<View>("graph");
   const [declutter, setDeclutter] = useState(false); // hide sandbox chrome for a clean view
+  const [volume, setVolume] = useState(0.35); // master audio volume (Settings)
   const [selectedId, setSelectedId] = useState(fluids[0].id);
   const [panelOpen, setPanelOpen] = useState(false); // the sidebar opens from the legend
   const overlap = useMemo(() => new OverlapField(), []);
@@ -1285,12 +1296,75 @@ export default function FluidScene() {
   const sandboxClean = declutter && inGraph; // decluttered sandbox: decorative chrome hidden
 
   // ---- the user's finances: read, forecast, and turned into graphs and planets ----
-  const projection = useProjection();
+  const [persona, setPersona] = useState<PersonaId>("tristan"); // demo dataset toggle
+  const projection = useProjection(persona);
+  const realData = projection.data;
+  // a hypothetical overlay built by applyScenario; the real projection is never touched
+  const [overlay, setOverlay] = useState<
+    { projection: Projection; label: string; delta: number; run: number } | null
+  >(null);
+  const activeData = overlay ? overlay.projection : realData;
   const scene = useMemo(
-    () => (projection.data ? buildFinanceScene(projection.data) : null),
-    [projection.data],
+    // a scenario overlay is sized against the real projection, so normal planets
+    // keep their size and only the changed category balloons
+    () => (activeData ? buildFinanceScene(activeData, realData ?? activeData) : null),
+    [activeData, realData],
   );
   const scrub = useMemo(() => new Scrub(), []);
+  const DEFAULT_SCRUB_MONTHS = 24; // the scrubber's default range; scenarios extend it to their run
+  const savedScrub = useRef(0); // scrub position to restore when leaving a scenario
+
+  const enterScenario = (s: Scenario) => {
+    if (!realData) return;
+    const proj = applyScenario(realData, s);
+    const run = runLength(realData, s);
+    const delta = proj.summary.netWorth[run] - realData.summary.netWorth[run];
+    savedScrub.current = scrub.get();
+    setOverlay({ projection: proj, label: s.label, delta, run });
+    scrub.set(run); // jump to the end of the run so the effect is visible at once
+    sfxWarp();
+  };
+  const exitScenario = () => {
+    if (!overlay) return;
+    scrub.set(savedScrub.current); // restore the previous scrub position
+    setOverlay(null);
+    sfxUnwarp();
+  };
+  const switchPersona = (id: PersonaId) => {
+    if (id === persona) return;
+    if (overlay) {
+      scrub.set(savedScrub.current);
+      setOverlay(null); // a scenario belongs to the old dataset; drop it
+    }
+    setPersona(id);
+  };
+  // Escape also leaves the hypothetical
+  useEffect(() => {
+    if (!overlay) return;
+    const onKey = (e: globalThis.KeyboardEvent) => {
+      if (e.key === "Escape") {
+        scrub.set(savedScrub.current);
+        setOverlay(null);
+        sfxUnwarp();
+      }
+    };
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, [overlay, scrub]);
+
+  // audio: push the volume setting to the engine, and start the ambient bed on
+  // the first user gesture (browsers won't let it autoplay before then)
+  useEffect(() => {
+    setAudioVolume(volume);
+  }, [volume]);
+  useEffect(() => {
+    const go = () => {
+      startAmbient();
+      setAudioVolume(volume);
+    };
+    window.addEventListener("pointerdown", go, { once: true });
+    return () => window.removeEventListener("pointerdown", go);
+  }, [volume]);
   // what the user protects first; orbit radius follows this (React state only)
   const [priority, setPriority] = useState<CategoryKey[]>(DEFAULT_PRIORITY);
   // target orbit index per fluid (by array position), from the current priority
@@ -1299,6 +1373,14 @@ export default function FluidScene() {
     const order = orbitOrder(keys, priority);
     return fluids.map((f, i) => (f.data ? order.get(f.data.key) ?? i : i));
   }, [fluids, priority]);
+  // Pluto can set the whole order; dedupe and backfill any it left out so all
+  // eight planets are always present.
+  const setPriorityOrder = (order: CategoryKey[]) =>
+    setPriority((prev) => {
+      const seen = new Set<CategoryKey>();
+      const next = [...order, ...prev].filter((k) => prev.includes(k) && !seen.has(k) && seen.add(k));
+      return next.length === prev.length ? next : prev;
+    });
   const movePriority = (key: CategoryKey, dir: -1 | 1) =>
     setPriority((prev) => {
       const i = prev.indexOf(key);
@@ -1313,20 +1395,36 @@ export default function FluidScene() {
   useEffect(() => {
     fluidsRef.current = fluids;
   }, [fluids]);
-  // When a new forecast arrives, turn it into graphs. Updating a graph refills its
-  // pool, which would yank a planet off its orbit, so a change that lands while the
-  // solar view is up waits until the user is back in the graph view.
+  // Turn a scene into graphs. Two cases:
+  //  - same categories, new numbers (a scenario overlay, or a refreshed forecast):
+  //    swap each fluid's data so radiusAt follows the new scene. The pool surface
+  //    is only reshaped in the graph view; in the solar view that refill would yank
+  //    a planet off its orbit, and planet size there comes from radiusAt anyway —
+  //    so a scenario is visible on the planets without waiting to return to graphs.
+  //  - different categories (first load): a full rebuild, which refills pools, so
+  //    it is deferred until the graph view.
   useEffect(() => {
-    if (!scene || !inGraph || syncedVersion.current === scene.version) return;
-    syncedVersion.current = scene.version;
+    if (!scene) return;
     const prev = fluidsRef.current;
-    const same =
+    const sameKeys =
       prev.length === scene.graphs.length &&
       prev.every((f, i) => f.data?.key === scene.graphs[i].key);
-    const next = scene.graphs.map((g, i) => {
-      const entry = same
-        ? prev[i]
-        : createFluid(1000 + g.orbit, g.slot, FLUID_COLORS[g.orbit % FLUID_COLORS.length]);
+
+    if (sameKeys) {
+      const next = prev.map((f, i) => {
+        const g = scene.graphs[i];
+        if (inGraph) f.sim.setSurface(gridToWorldSurface(g.surface));
+        return { ...f, expr: g.label, data: g };
+      });
+      setFluids(next);
+      if (inGraph) syncedVersion.current = scene.version; // surface only truly synced in graphs
+      return;
+    }
+
+    if (!inGraph || syncedVersion.current === scene.version) return;
+    syncedVersion.current = scene.version;
+    const next = scene.graphs.map((g) => {
+      const entry = createFluid(1000 + g.orbit, g.slot, FLUID_COLORS[g.orbit % FLUID_COLORS.length]);
       entry.sim.setSurface(gridToWorldSurface(g.surface));
       return { ...entry, expr: g.label, data: g };
     });
@@ -1436,9 +1534,34 @@ export default function FluidScene() {
         aria-hidden
         className="pointer-events-none absolute inset-0 bg-[radial-gradient(ellipse_at_center,transparent_55%,rgba(6,3,20,0.55)_100%)]"
       />
+      {/* a distinct tint while a hypothetical scenario is overlaid */}
+      <div
+        aria-hidden
+        className={
+          "pointer-events-none absolute inset-0 bg-fuchsia-600/15 transition-opacity duration-500 " +
+          (overlay ? "opacity-100" : "opacity-0")
+        }
+      />
 
       <PageFrame />
       <ViewTabs view={view} onChange={setView} />
+
+      {/* inconspicuous demo-only dataset toggle, tucked at the very top */}
+      <div className="rise absolute left-1/2 top-1 z-10 flex -translate-x-1/2 select-none items-center gap-1.5 text-[0.62rem] tracking-wide text-white/35">
+        {(["tristan", "yuva"] as PersonaId[]).map((id) => (
+          <button
+            key={id}
+            onClick={() => switchPersona(id)}
+            aria-pressed={persona === id}
+            className={
+              (persona === id ? "text-white/70" : "text-white/35 hover:text-white/55") + " " + FOCUS
+            }
+          >
+            {id === "tristan" ? "Tristan" : "Yuva"}
+          </button>
+        ))}
+        <span className="ml-1 uppercase tracking-[0.18em] text-white/20">demo only</span>
+      </div>
 
       <SettingsMenu
         inGraph={inGraph}
@@ -1450,6 +1573,8 @@ export default function FluidScene() {
         onUnderDimming={setUnderDimming}
         declutter={declutter}
         onDeclutter={setDeclutter}
+        volume={volume}
+        onVolume={setVolume}
         onReset={() => fluids.forEach((f) => f.sim.reset())}
       />
 
@@ -1483,7 +1608,14 @@ export default function FluidScene() {
         />
       )}
 
-      {scene && <Scrubber scrub={scrub} scene={scene} show={!inGraph} />}
+      {scene && (
+        <Scrubber
+          scrub={scrub}
+          scene={scene}
+          show={!inGraph}
+          scrubMax={overlay ? overlay.run : DEFAULT_SCRUB_MONTHS}
+        />
+      )}
       {scene && (
         <ControlCenter
           scrub={scrub}
@@ -1494,6 +1626,17 @@ export default function FluidScene() {
         />
       )}
       <AgentStatus state={projection} />
+
+      {/* Pluto the guide + the hypothetical overlay he conjures */}
+      <PlutoChat onScenario={enterScenario} onPriority={setPriorityOrder} />
+      {overlay && (
+        <ScenarioBanner
+          label={overlay.label}
+          delta={overlay.delta}
+          show={true}
+          onExit={exitScenario}
+        />
+      )}
     </div>
   );
 }

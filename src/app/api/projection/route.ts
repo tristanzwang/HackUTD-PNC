@@ -1,5 +1,6 @@
 import type { NextRequest } from "next/server";
 import { getProjection } from "@/lib/finance/pipeline";
+import type { PersonaId } from "@/lib/finance/synth";
 
 /**
  * The user's projected finances. Reading the request makes this a request-time
@@ -10,8 +11,10 @@ import { getProjection } from "@/lib/finance/pipeline";
  */
 export async function GET(request: NextRequest) {
   const force = request.nextUrl.searchParams.get("refresh") === "1";
+  const raw = request.nextUrl.searchParams.get("persona");
+  const persona: PersonaId | undefined = raw === "yuva" ? "yuva" : raw === "tristan" ? "tristan" : undefined;
   try {
-    const projection = await getProjection({ force });
+    const projection = await getProjection({ force, persona });
     return Response.json(projection, { headers: { "Cache-Control": "no-store" } });
   } catch (e) {
     return Response.json(

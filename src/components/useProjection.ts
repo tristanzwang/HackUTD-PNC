@@ -2,6 +2,7 @@
 
 import { useEffect, useState } from "react";
 import type { Projection } from "@/lib/finance/projection";
+import type { PersonaId } from "@/lib/finance/synth";
 
 export type ProjectionState = {
   data: Projection | null;
@@ -17,31 +18,34 @@ export type ProjectionState = {
  * transaction arrives (not on a clock); the server re-runs the agents only if the
  * history actually changed.
  */
-export function useProjection(): ProjectionState {
+export function useProjection(persona?: PersonaId): ProjectionState {
   const [state, setState] = useState<ProjectionState>({ data: null, error: null, loading: true });
 
   useEffect(() => {
     let alive = true;
+    // keep the current forecast on screen while a different persona loads
+    setState((s) => ({ ...s, loading: true, error: null }));
     (async () => {
       try {
-        const res = await fetch("/api/projection", { cache: "no-store" });
+        const url = persona ? `/api/projection?persona=${persona}` : "/api/projection";
+        const res = await fetch(url, { cache: "no-store" });
         if (!res.ok) throw new Error(`projection request failed (${res.status})`);
         const data = (await res.json()) as Projection;
         if (alive) setState({ data, error: null, loading: false });
       } catch (e) {
         if (alive) {
-          setState({
-            data: null,
+          setState((s) => ({
+            data: s.data,
             loading: false,
             error: e instanceof Error ? e.message : "could not load projections",
-          });
+          }));
         }
       }
     })();
     return () => {
       alive = false;
     };
-  }, []);
+  }, [persona]);
 
   return state;
 }

@@ -46,6 +46,25 @@
   }
 }
 
+/* Pluto, idling: a slow, subtle bob + wobble + breath, so the little planet feels alive. */
+@keyframes pluto-bob {
+  0%,
+  100% {
+    transform: translateY(0) rotate(-3deg) scale(1);
+  }
+  50% {
+    transform: translateY(-2px) rotate(3deg) scale(1.05);
+  }
+}
+.pluto-bob {
+  animation: pluto-bob 4.5s ease-in-out infinite;
+}
+@media (prefers-reduced-motion: reduce) {
+  .pluto-bob {
+    animation: none;
+  }
+}
+
 /* Range slider: a thin filled track and a white thumb that grows under the finger. */
 .slider {
   -webkit-appearance: none;

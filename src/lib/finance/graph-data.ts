@@ -79,7 +79,26 @@ function sample(a: number[], i: number) {
 /** "Nov 2026" -> "Nov ’26" */
 const shortMonth = (m: string) => m.replace(/ \d\d(\d\d)$/, " ’$1");
 
-export function buildFinanceScene(p: Projection): FinanceScene {
+/**
+ * The height/size normalisation: the tallest range (`largest`) and the biggest
+ * body today-or-later (`biggest`). Drawn from `scaleRef` so a "what if" overlay
+ * can be sized against the REAL projection — otherwise one runaway category (a
+ * decade of gambling debt) collapses every other planet to a speck.
+ */
+function sceneScale(scaleRef: Projection, hist: number, today: number) {
+  let largest = 0;
+  let biggest = 0;
+  for (const c of scaleRef.categories) {
+    const h = c.history.slice(-hist);
+    const hi = [...h, ...c.forecast.map((f) => f.hi)];
+    for (const v of hi) largest = Math.max(largest, v);
+    const mid = [...h, ...c.forecast.map((f) => f.value)];
+    for (const v of mid.slice(today)) biggest = Math.max(biggest, v);
+  }
+  return { largest: largest || 1, biggest: biggest || 1 };
+}
+
+export function buildFinanceScene(p: Projection, scaleRef: Projection = p): FinanceScene {
   const hist = Math.min(HISTORY_WINDOW, p.months.length);
   const N = hist + p.horizon;
   const today = hist - 1; // index of the last history month along the time axis
@@ -99,15 +118,9 @@ export function buildFinanceScene(p: Projection): FinanceScene {
     });
   }
 
-  // heights are shared across graphs, so sizes stay comparable between planets
-  let largest = 0;
-  for (const s of series.values()) for (const v of s.hi) largest = Math.max(largest, v);
-  largest = largest || 1;
-
-  // the biggest any category gets, today or in the forecast, is the full-size planet
-  let biggest = 0;
-  for (const s of series.values()) for (const v of s.mid.slice(today)) biggest = Math.max(biggest, v);
-  biggest = biggest || 1;
+  // sizes are shared across graphs and (for an overlay) against the real scene,
+  // so a scenario shows its one category ballooning without shrinking the rest
+  const { largest, biggest } = sceneScale(scaleRef, hist, today);
 
   const latest: Record<string, number> = {};
   for (const c of p.categories) latest[c.key] = c.history[c.history.length - 1];

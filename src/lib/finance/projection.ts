@@ -176,6 +176,33 @@ function insightFor(
 const ASSETS: CategoryKey[] = ["checking", "savings", "retirement"];
 const SPENDING: CategoryKey[] = ["housing", "essentials", "discretionary", "subscriptions"];
 
+/**
+ * Net worth, surplus, assets and debt for k = 0 (today) .. horizon, read from the
+ * categories' `forecast` (or `baseline`). Exported so a scenario overlay can
+ * recompute it from edited forecasts without duplicating the accounting rules.
+ */
+export function summaryOf(
+  categories: CategoryProjection[],
+  horizon: number,
+  which: "forecast" | "baseline" = "forecast",
+): Summary {
+  const at = (key: CategoryKey, k: number) => {
+    const c = categories.find((x) => x.key === key);
+    if (!c) return 0;
+    return k === 0 ? c.history[c.history.length - 1] : c[which][k - 1].value;
+  };
+  const s: Summary = { netWorth: [], surplus: [], assets: [], debt: [] };
+  for (let k = 0; k <= horizon; k++) {
+    const assets = ASSETS.reduce((a, key) => a + at(key, k), 0);
+    const debt = at("card", k);
+    s.assets.push(assets);
+    s.debt.push(debt);
+    s.netWorth.push(assets - debt);
+    s.surplus.push(at("income", k) - SPENDING.reduce((a, key) => a + at(key, k), 0));
+  }
+  return s;
+}
+
 function futureMonthLabels(last: string, horizon: number): string[] {
   const names = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"];
   const [mon, yr] = last.split(" ");
@@ -237,26 +264,8 @@ export function buildProjection(
     };
   });
 
-  // k = 0 is today (history), identical for both; k >= 1 reads the chosen horizon.
-  const reader = (which: "forecast" | "baseline") => (key: CategoryKey, k: number) => {
-    const c = categories.find((x) => x.key === key);
-    if (!c) return 0;
-    return k === 0 ? c.history[c.history.length - 1] : c[which][k - 1].value;
-  };
-  const summarize = (at: (key: CategoryKey, k: number) => number): Summary => {
-    const s: Summary = { netWorth: [], surplus: [], assets: [], debt: [] };
-    for (let k = 0; k <= horizon; k++) {
-      const assets = ASSETS.reduce((a, key) => a + at(key, k), 0);
-      const debt = at("card", k);
-      s.assets.push(assets);
-      s.debt.push(debt);
-      s.netWorth.push(assets - debt);
-      s.surplus.push(at("income", k) - SPENDING.reduce((a, key) => a + at(key, k), 0));
-    }
-    return s;
-  };
-  const summary = summarize(reader("forecast"));
-  const baselineSummary = summarize(reader("baseline"));
+  const summary = summaryOf(categories, horizon, "forecast");
+  const baselineSummary = summaryOf(categories, horizon, "baseline");
 
   const live = categories.some((c) => c.model.source === "nemotron");
   return {

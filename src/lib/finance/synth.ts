@@ -93,6 +93,30 @@ export const COLLEGE_STUDENT: CategorySpec[] = [
   { key: "card",          label: "Credit card",   kind: "debt",    truth: { level: 1850, drift: 0.0115, seasonAmp: 0.14, seasonPeak: 11, noise: 0.07 } },
 ];
 
+/**
+ * A second demo profile: an early-career professional. Higher income, a real
+ * savings and retirement habit, a small card balance — a clear contrast to the
+ * thin-margin student, so the two datasets look obviously different.
+ */
+export const YOUNG_PRO: CategorySpec[] = [
+  { key: "income",        label: "Income",        kind: "inflow",  truth: { level: 4200, drift: 0.0052, seasonAmp: 0.05, seasonPeak: 2,  noise: 0.04  } },
+  { key: "housing",       label: "Rent",          kind: "outflow", truth: { level: 1650, drift: 0.0035, seasonAmp: 0.0,  seasonPeak: 0,  noise: 0.003 } },
+  { key: "essentials",    label: "Essentials",    kind: "outflow", truth: { level: 620,  drift: 0.0028, seasonAmp: 0.08, seasonPeak: 10, noise: 0.07  } },
+  { key: "discretionary", label: "Discretionary", kind: "outflow", truth: { level: 540,  drift: 0.0020, seasonAmp: 0.26, seasonPeak: 6,  noise: 0.20  } },
+  { key: "subscriptions", label: "Subscriptions", kind: "outflow", truth: { level: 112,  drift: 0.0060, seasonAmp: 0.0,  seasonPeak: 0,  noise: 0.02  } },
+  { key: "checking",      label: "Checking",      kind: "balance", truth: { level: 3100, drift: 0.0030, seasonAmp: 0.12, seasonPeak: 3,  noise: 0.12  } },
+  { key: "savings",       label: "Savings",       kind: "balance", truth: { level: 9400, drift: 0.0120, seasonAmp: 0.0,  seasonPeak: 0,  noise: 0.04  } },
+  { key: "retirement",    label: "Retirement",    kind: "balance", truth: { level: 15200,drift: 0.0150, seasonAmp: 0.0,  seasonPeak: 0,  noise: 0.07  } },
+  { key: "card",          label: "Credit card",   kind: "debt",    truth: { level: 820,  drift: 0.0060, seasonAmp: 0.10, seasonPeak: 11, noise: 0.06  } },
+];
+
+/** The two selectable demo datasets. "tristan" keeps the original student numbers. */
+export const PERSONAS = {
+  tristan: { id: "tristan", label: "Tristan orbit", categories: COLLEGE_STUDENT },
+  yuva: { id: "yuva", label: "Yuva orbit", categories: YOUNG_PRO },
+} as const;
+export type PersonaId = keyof typeof PERSONAS;
+
 export function makePersona(opts: {
   id: string;
   label: string;

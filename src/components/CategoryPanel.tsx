@@ -5,6 +5,7 @@ import type { FinanceGraph, FinanceScene } from "@/lib/finance/graph-data";
 import type { ModelInfo } from "@/lib/finance/projection";
 import { formatUSD } from "@/lib/finance/scene-bridge";
 import type { Scrub } from "@/lib/finance/scrub";
+import { Typewriter } from "./FinanceUI";
 import { Divider, Orb } from "./Ornaments";
 import { FOCUS, GLASS, PRESS, materialize } from "./ui";
 
@@ -141,7 +142,12 @@ export default function CategoryPanel({
           title={m.rationale}
           className="mt-1.5 line-clamp-4 text-[0.98rem] italic leading-snug text-white/65"
         >
-          {m.rationale}
+          {/* type Nemotron's rationale out the first time this panel is opened */}
+          {open && m.source === "nemotron" ? (
+            <Typewriter key={m.rationale} text={m.rationale} />
+          ) : (
+            m.rationale
+          )}
         </p>
         <div className="mt-2.5 flex items-center gap-2 text-sm text-white/45">
           Confidence

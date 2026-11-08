@@ -67,6 +67,59 @@ export const ResidualCause = z.object({
 });
 export type ResidualCause = z.infer<typeof ResidualCause>;
 
+/**
+ * A chat "what if" turned into a structured scenario, OR a refusal. Nemotron only
+ * names the category, per-occurrence amount, cadence, duration and a short label;
+ * it computes NO dollar outcomes. If it can't map the request to a known category
+ * it returns kind "none" with a one-sentence reply saying what it could not place.
+ */
+export const ScenarioIntent = z.discriminatedUnion("kind", [
+  z.object({
+    kind: z.literal("scenario"),
+    /** Pluto's one or two sentences, in his own voice, about the what-if. */
+    reply: z.string().min(1).max(300),
+    scenario: z.object({
+      label: z.string().min(1).max(80),
+      deltas: z
+        .array(
+          z.object({
+            category: z.enum([
+              "income", "checking", "savings", "housing", "essentials",
+              "discretionary", "subscriptions", "retirement", "card",
+            ]),
+            /** Dollars per occurrence. Negative reduces the category. */
+            amount: z.number(),
+            cadence: z.enum(["daily", "weekly", "monthly", "once"]),
+            /** Months the delta runs for, from now. */
+            months: z.number().int().min(1).max(120),
+          }),
+        )
+        .min(1)
+        .max(4),
+    }),
+  }),
+  z.object({
+    kind: z.literal("priority"),
+    /** Pluto's one or two sentences about the new ordering. */
+    reply: z.string().min(1).max(300),
+    /** Orbit priority, most-protected (closest to the sun) first. */
+    order: z
+      .array(
+        z.enum([
+          "housing", "essentials", "card", "savings",
+          "retirement", "subscriptions", "discretionary", "checking",
+        ]),
+      )
+      .min(1)
+      .max(8),
+  }),
+  z.object({
+    kind: z.literal("none"),
+    reply: z.string().min(1).max(400),
+  }),
+]);
+export type ScenarioIntent = z.infer<typeof ScenarioIntent>;
+
 /** Cluster label for a batch of merchant strings. */
 export const ClusterLabel = z.object({
   label: z.string().min(1).max(40),

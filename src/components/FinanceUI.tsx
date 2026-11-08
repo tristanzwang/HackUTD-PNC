@@ -1,9 +1,11 @@
 "use client";
 
-import { useEffect, useState, useSyncExternalStore } from "react";
+import { useEffect, useRef, useState, useSyncExternalStore } from "react";
 import type { FinanceScene, ForecastMode } from "@/lib/finance/graph-data";
 import { formatUSD } from "@/lib/finance/scene-bridge";
+import type { Scenario } from "@/lib/finance/scenario";
 import type { Scrub } from "@/lib/finance/scrub";
+import { sfxReceive, sfxSend } from "@/lib/sfx";
 import type { CategoryKey } from "@/lib/finance/synth";
 import type { ProjectionState } from "./useProjection";
 import { FOCUS, GLASS, PRESS, materialize } from "./ui";
@@ -19,11 +21,16 @@ export function Scrubber({
   scrub,
   scene,
   show,
+  scrubMax,
 }: {
   scrub: Scrub;
   scene: FinanceScene;
   show: boolean;
+  /** Months the scrubber reaches. Defaults to the full horizon; the app keeps it at 24
+   *  normally and extends it to a scenario's run so long scenarios stay reachable. */
+  scrubMax?: number;
 }) {
+  const max = Math.min(scrubMax ?? scene.horizon, scene.horizon);
   const k = useSyncExternalStore(scrub.subscribe, scrub.get, scrub.get);
   const [playing, setPlaying] = useState(false);
   const running = playing && show;
@@ -35,8 +42,8 @@ export function Scrubber({
     const tick = (now: number) => {
       const next = scrub.k + ((now - last) / 1000) * MONTHS_PER_SECOND;
       last = now;
-      if (next >= scene.horizon) {
-        scrub.set(scene.horizon);
+      if (next >= max) {
+        scrub.set(max);
         setPlaying(false);
         return;
       }
@@ -45,7 +52,7 @@ export function Scrubber({
     };
     raf = requestAnimationFrame(tick);
     return () => cancelAnimationFrame(raf);
-  }, [running, scrub, scene.horizon]);
+  }, [running, scrub, max]);
 
   const step = Math.min(Math.round(k), scene.horizon);
   const worthNow = scene.summary.netWorth[0];
@@ -67,7 +74,7 @@ export function Scrubber({
       <div className="flex items-center gap-3">
         <button
           onClick={() => {
-            if (!playing && k >= scene.horizon) scrub.set(0);
+            if (!playing && k >= max) scrub.set(0);
             setPlaying((p) => !p);
           }}
           aria-label={running ? "Pause" : "Play through the future"}
@@ -111,9 +118,9 @@ export function Scrubber({
           <input
             type="range"
             min={0}
-            max={scene.horizon}
+            max={max}
             step={0.05}
-            value={k}
+            value={Math.min(k, max)}
             onChange={(e) => {
               setPlaying(false);
               scrub.set(parseFloat(e.target.value));
@@ -121,7 +128,7 @@ export function Scrubber({
             aria-label="Months from today"
             aria-valuetext={months === 0 ? "Today" : `${months} months from today`}
             className="slider mt-1 w-full"
-            style={{ "--fill": `${(k / scene.horizon) * 100}%` } as React.CSSProperties}
+            style={{ "--fill": `${(Math.min(k, max) / max) * 100}%` } as React.CSSProperties}
           />
         </div>
       </div>
@@ -399,6 +406,378 @@ export function AgentStatus({ state }: { state: ProjectionState }) {
           cached
         </span>
       )}
+    </div>
+  );
+}
+
+/** Strip an optional "Pluto" wake word (any case, optional comma) from the front. */
+function stripWakeWord(s: string): string {
+  return s.replace(/^\s*pluto\b\s*,?\s*/i, "");
+}
+
+// Text the user has already watched type out once; reopening shows it at once.
+const typed = new Set<string>();
+const prefersReducedMotion = () =>
+  typeof window !== "undefined" && window.matchMedia("(prefers-reduced-motion: reduce)").matches;
+
+/**
+ * Types `text` out at a natural pace the FIRST time it is shown — used for prose
+ * Nemotron generated (a category's rationale, a scenario reply), so reading it
+ * feels like it is being written. Already-seen text (and reduced motion) appears
+ * instantly. ~220 wpm.
+ */
+// NOTE: give this a `key={text}` at the call site, so a new text remounts it and
+// re-runs the animation from the start.
+export function Typewriter({ text, className }: { text: string; className?: string }) {
+  const animate = !typed.has(text) && !prefersReducedMotion();
+  const [len, setLen] = useState(animate ? 0 : text.length);
+
+  useEffect(() => {
+    if (!animate) return;
+    const id = window.setInterval(() => {
+      setLen((n) => {
+        if (n >= text.length) {
+          typed.add(text);
+          window.clearInterval(id);
+          return n;
+        }
+        return n + 1;
+      });
+    }, 46);
+    return () => window.clearInterval(id);
+  }, [text, animate]);
+
+  return <span className={className}>{text.slice(0, len)}</span>;
+}
+
+type ChatReply =
+  | { kind: "scenario"; reply: string; scenario: Scenario }
+  | { kind: "priority"; reply: string; order: CategoryKey[] }
+  | { kind: "none"; reply: string };
+
+type PlutoMsg = { role: "you" | "pluto"; text: string };
+
+const PANEL_W = 340; // px; used to keep the panel on screen
+const PANEL_H = 440;
+
+/** Clamp a panel top-left so the whole panel stays within the viewport. */
+function clampToViewport(x: number, y: number): { x: number; y: number } {
+  return {
+    x: Math.min(Math.max(x, 8), Math.max(8, window.innerWidth - PANEL_W - 8)),
+    y: Math.min(Math.max(y, 8), Math.max(8, window.innerHeight - PANEL_H - 8)),
+  };
+}
+
+/** Pluto's planet glyph, idly bobbing. */
+function PlutoGlyph({ size }: { size: number }) {
+  return (
+    // eslint-disable-next-line @next/next/no-img-element
+    <img
+      src="/pluto.png"
+      alt=""
+      width={size}
+      height={size}
+      draggable={false}
+      className="pluto-bob object-contain"
+    />
+  );
+}
+
+/**
+ * Pluto, the guide. A small wobbling badge in the corner that opens into a
+ * draggable chat panel. He talks like a friend and only conjures a "what if"
+ * overlay when you actually ask for one. React state only — nothing persisted.
+ */
+export function PlutoChat({
+  onScenario,
+  onPriority,
+}: {
+  onScenario: (s: Scenario) => void;
+  onPriority: (order: CategoryKey[]) => void;
+}) {
+  const [open, setOpen] = useState(false);
+  const [messages, setMessages] = useState<PlutoMsg[]>([]);
+  const [input, setInput] = useState("");
+  const [busy, setBusy] = useState(false);
+  const [unread, setUnread] = useState(false);
+  const [pos, setPos] = useState<{ x: number; y: number } | null>(null);
+  const openRef = useRef(open);
+  const drag = useRef<{ dx: number; dy: number } | null>(null);
+  const bodyRef = useRef<HTMLDivElement>(null);
+
+  useEffect(() => {
+    openRef.current = open;
+  }, [open]);
+
+  const openPanel = () => {
+    // open from the top-left corner the badge sits in, the first time
+    setPos((p) => p ?? clampToViewport(20, 20));
+    setOpen(true);
+    setUnread(false);
+  };
+
+  // keep it fully on screen when the window resizes
+  useEffect(() => {
+    const onResize = () => setPos((p) => (p ? clampToViewport(p.x, p.y) : p));
+    window.addEventListener("resize", onResize);
+    return () => window.removeEventListener("resize", onResize);
+  }, []);
+
+  // stick to the newest message
+  useEffect(() => {
+    bodyRef.current?.scrollTo({ top: bodyRef.current.scrollHeight });
+  }, [messages, open, busy]);
+
+  const send = async () => {
+    const message = stripWakeWord(input).trim();
+    if (!message || busy) return;
+    setInput("");
+    setMessages((m) => [...m, { role: "you", text: message }]);
+    setBusy(true);
+    sfxSend();
+    try {
+      const res = await fetch("/api/chat", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ message }),
+      });
+      const data = (await res.json()) as ChatReply;
+      setMessages((m) => [...m, { role: "pluto", text: data.reply }]);
+      sfxReceive();
+      if (data.kind === "scenario") onScenario(data.scenario);
+      else if (data.kind === "priority") onPriority(data.order);
+    } catch {
+      setMessages((m) => [...m, { role: "pluto", text: "I couldn’t reach the stars just now — try again?" }]);
+    } finally {
+      setBusy(false);
+      if (!openRef.current) setUnread(true);
+    }
+  };
+
+  // drag the panel by its header
+  const onHeaderDown = (e: React.PointerEvent) => {
+    if (!pos) return;
+    (e.currentTarget as HTMLElement).setPointerCapture(e.pointerId);
+    drag.current = { dx: e.clientX - pos.x, dy: e.clientY - pos.y };
+  };
+  const onHeaderMove = (e: React.PointerEvent) => {
+    if (!drag.current) return;
+    setPos(clampToViewport(e.clientX - drag.current.dx, e.clientY - drag.current.dy));
+  };
+  const onHeaderUp = (e: React.PointerEvent) => {
+    drag.current = null;
+    (e.currentTarget as HTMLElement).releasePointerCapture?.(e.pointerId);
+  };
+
+  return (
+    <>
+      {/* collapsed: a small wobbling badge in the corner */}
+      <button
+        onClick={openPanel}
+        aria-label="Open Pluto"
+        className={
+          "absolute left-5 top-5 flex items-center gap-2 rounded-full py-1.5 pl-1.5 pr-3.5 text-white " +
+          "transition-opacity duration-300 " +
+          (open ? "pointer-events-none opacity-0 " : "opacity-100 ") +
+          GLASS +
+          " " +
+          PRESS +
+          " " +
+          FOCUS
+        }
+      >
+        <span className="relative flex h-8 w-8 items-center justify-center">
+          <PlutoGlyph size={30} />
+          {unread && (
+            <span className="absolute -right-0.5 -top-0.5 h-2.5 w-2.5 rounded-full bg-sky-400 ring-2 ring-[#0b1226]" />
+          )}
+        </span>
+        <span className="text-[0.95rem] font-medium tracking-[0.01em]">Pluto</span>
+      </button>
+
+      {/* expanded: the draggable chat panel */}
+      {pos && (
+        <div
+          inert={!open}
+          style={{ left: pos.x, top: pos.y, width: PANEL_W }}
+          className={
+            "absolute flex max-h-[min(27.5rem,calc(100vh-2.5rem))] flex-col overflow-hidden " +
+            "rounded-[1.5rem] text-white " +
+            GLASS +
+            " " +
+            materialize(open)
+          }
+        >
+          {/* header is the drag handle */}
+          <div
+            onPointerDown={onHeaderDown}
+            onPointerMove={onHeaderMove}
+            onPointerUp={onHeaderUp}
+            className="flex cursor-grab touch-none select-none items-center gap-2 px-3 py-2.5 active:cursor-grabbing"
+          >
+            <PlutoGlyph size={26} />
+            <span className="flex-1 text-[1rem] font-semibold tracking-[0.01em]">Pluto</span>
+            <button
+              onPointerDown={(e) => e.stopPropagation()}
+              onClick={() => setMessages([])}
+              disabled={messages.length === 0}
+              className={
+                "rounded-full px-2.5 py-1 text-[0.78rem] text-white/60 enabled:hover:bg-white/10 " +
+                "enabled:hover:text-white disabled:opacity-30 " +
+                PRESS +
+                " " +
+                FOCUS
+              }
+            >
+              Clear
+            </button>
+            <button
+              onPointerDown={(e) => e.stopPropagation()}
+              onClick={() => setOpen(false)}
+              aria-label="Collapse Pluto"
+              className={
+                "flex h-7 w-7 items-center justify-center rounded-full text-white/60 hover:bg-white/10 " +
+                "hover:text-white " +
+                PRESS +
+                " " +
+                FOCUS
+              }
+            >
+              <svg width="12" height="12" viewBox="0 0 12 12" aria-hidden>
+                <path d="M2.5 6h7" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" />
+              </svg>
+            </button>
+          </div>
+
+          {/* transcript */}
+          <div
+            ref={bodyRef}
+            className="flex-1 space-y-2 overflow-y-auto px-3 pb-2 [scrollbar-width:thin]"
+          >
+            {messages.length === 0 && (
+              <p className="px-1 py-6 text-center text-[0.92rem] leading-snug text-white/45">
+                Hi, I’m Pluto. Ask me about your money — or try a what-if and watch it play out.
+              </p>
+            )}
+            {messages.map((m, i) =>
+              m.role === "you" ? (
+                <p
+                  key={i}
+                  className="ml-auto w-fit max-w-[85%] rounded-2xl rounded-br-md bg-sky-400/20 px-3 py-1.5 text-[0.92rem] leading-snug"
+                >
+                  {m.text}
+                </p>
+              ) : (
+                <p
+                  key={i}
+                  className="mr-auto w-fit max-w-[90%] rounded-2xl rounded-bl-md bg-white/[0.07] px-3 py-1.5 text-[0.92rem] leading-snug text-white/85"
+                >
+                  <Typewriter key={m.text} text={m.text} />
+                </p>
+              ),
+            )}
+            {busy && (
+              <p className="mr-auto flex w-fit gap-1 rounded-2xl bg-white/[0.07] px-3 py-2.5">
+                <span className="h-1.5 w-1.5 animate-pulse rounded-full bg-white/60" />
+                <span className="h-1.5 w-1.5 animate-pulse rounded-full bg-white/60 [animation-delay:150ms]" />
+                <span className="h-1.5 w-1.5 animate-pulse rounded-full bg-white/60 [animation-delay:300ms]" />
+              </p>
+            )}
+          </div>
+
+          {/* input */}
+          <form
+            onSubmit={(e) => {
+              e.preventDefault();
+              void send();
+            }}
+            className="flex items-center gap-2 p-2.5"
+          >
+            <input
+              value={input}
+              onChange={(e) => setInput(e.target.value)}
+              disabled={busy}
+              placeholder="Talk to Pluto…"
+              aria-label="Message Pluto"
+              className={
+                "min-w-0 flex-1 rounded-full bg-white/[0.06] px-3.5 py-2 text-[0.95rem] " +
+                "placeholder:text-white/35 focus:outline-none " +
+                FOCUS
+              }
+            />
+            <button
+              type="submit"
+              disabled={busy || !input.trim()}
+              aria-label="Send"
+              className={
+                "flex h-9 w-9 shrink-0 items-center justify-center rounded-full border border-white/25 " +
+                "bg-white/[0.06] hover:bg-white/15 disabled:opacity-40 " +
+                PRESS +
+                " " +
+                FOCUS
+              }
+            >
+              <svg width="14" height="14" viewBox="0 0 14 14" aria-hidden>
+                <path d="M2 7h8M7 3l4 4-4 4" stroke="currentColor" strokeWidth="1.6" fill="none" strokeLinecap="round" strokeLinejoin="round" />
+              </svg>
+            </button>
+          </form>
+        </div>
+      )}
+    </>
+  );
+}
+
+/**
+ * The hypothetical banner: the scenario label and its net-worth difference at the
+ * end of the run against reality, with a way back. Shown while an overlay is up.
+ */
+export function ScenarioBanner({
+  label,
+  delta,
+  show,
+  onExit,
+}: {
+  label: string;
+  delta: number;
+  show: boolean;
+  onExit: () => void;
+}) {
+  const up = delta >= 0;
+  return (
+    <div
+      inert={!show}
+      className={
+        "absolute left-1/2 top-[4.75rem] flex w-[min(44rem,calc(100vw-2.5rem))] -translate-x-1/2 select-none " +
+        "items-center gap-4 rounded-full px-5 py-2.5 text-white ring-1 ring-fuchsia-300/25 " +
+        GLASS +
+        " " +
+        materialize(show)
+      }
+    >
+      <span className="shrink-0 rounded-full bg-fuchsia-400/20 px-2.5 py-0.5 text-[0.62rem] font-semibold uppercase tracking-[0.18em] text-fuchsia-100/90">
+        What if
+      </span>
+      <Typewriter key={label} text={label} className="min-w-0 flex-1 truncate text-[1rem]" />
+      <span className="shrink-0 text-[0.95rem] tabular-nums">
+        Net worth{" "}
+        <span className={up ? "text-emerald-300" : "text-rose-300"}>
+          {up ? "+" : "−"}
+          {formatUSD(Math.abs(delta))}
+        </span>
+      </span>
+      <button
+        onClick={onExit}
+        className={
+          "shrink-0 rounded-full px-3.5 py-1 text-[0.9rem] text-white " +
+          "border border-white/25 bg-white/[0.06] hover:bg-white/15 " +
+          PRESS +
+          " " +
+          FOCUS
+        }
+      >
+        Back to reality
+      </button>
     </div>
   );
 }

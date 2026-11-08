@@ -11,9 +11,17 @@
 import { chooseModel } from "../agents/estimator";
 import { buildProjection, heuristicChoice, type Choice, type Projection } from "./projection";
 import snapshot from "./projection-snapshot.json";
-import { makePersona, type CategoryKey, type Persona } from "./synth";
+import { PERSONAS, makePersona, type CategoryKey, type Persona, type PersonaId } from "./synth";
 
-export const HORIZON = 24;
+export const DEFAULT_PERSONA: PersonaId = "tristan";
+
+// Ten years, so a long "what if" scenario is reachable. The scrubber's default
+// visible range stays at 24 (see DEFAULT_SCRUB_MONTHS), so raising this does not
+// change the normal view — long scenarios are reached by scrubbing out.
+export const HORIZON = 120;
+
+/** The scrubber shows this many months by default; scenarios extend it to their run. */
+export const DEFAULT_SCRUB_MONTHS = 24;
 
 // ---------------------------------------------------------------------------
 // the history source
@@ -25,11 +33,13 @@ export const HORIZON = 24;
  * real data exists (transactions rolled up to these categories by month), replace
  * the body of this one function and nothing else in the pipeline changes.
  */
-export async function loadHistory(): Promise<Persona> {
+export async function loadHistory(persona: PersonaId = DEFAULT_PERSONA): Promise<Persona> {
   const now = new Date();
+  const p = PERSONAS[persona];
   return makePersona({
-    id: "student",
-    label: "College student",
+    id: p.id,
+    label: p.label,
+    categories: p.categories,
     nMonths: 36,
     endYear: now.getFullYear(),
     endMonth: now.getMonth(),
@@ -125,29 +135,33 @@ async function chooseAll(persona: Persona) {
 
 type Cached = { version: string; result: Projection; stale: boolean };
 
-// Seed the cache from the snapshot built by scripts/build-snapshot.ts. A cold
-// serverless start then answers the first request from this instead of blocking
-// on ~9 Nemotron calls. It is keyed by its own `version`, so it is only served
-// while the current history hashes to that same version; a different hash (or
-// opts.force) falls through to a live run below. The file is `{}` until the
-// script has been run once, in which case there is no usable seed.
-let cache: Cached | null =
-  typeof (snapshot as Partial<Projection>).version === "string"
-    ? { version: (snapshot as Projection).version, result: snapshot as Projection, stale: true }
-    : null;
-let inflight: Promise<Projection> | null = null;
-export async function getProjection(opts: { force?: boolean } = {}): Promise<Projection> {
-  const persona = await loadHistory();
+// Cache keyed by history version, so each persona (and each unchanged history)
+// is remembered separately — toggling datasets re-runs the agents once, then is
+// free. Seeded from the snapshot built by scripts/build-snapshot.ts so a cold
+// serverless start answers the default persona without ~9 Nemotron calls.
+const cache = new Map<string, Cached>();
+if (typeof (snapshot as Partial<Projection>).version === "string") {
+  const v = (snapshot as Projection).version;
+  cache.set(v, { version: v, result: snapshot as Projection, stale: true });
+}
+const inflight = new Map<string, Promise<Projection>>();
+
+export async function getProjection(
+  opts: { force?: boolean; persona?: PersonaId } = {},
+): Promise<Projection> {
+  const persona = await loadHistory(opts.persona);
   const version = versionOf(persona);
-  // Same history, same answer: never re-spend model tokens on data we have already read.
-  if (cache && cache.version === version && !opts.force) {
+  // Same history, same answer: never re-spend model tokens on data we've read.
+  const hit = cache.get(version);
+  if (hit && !opts.force) {
     // Snapshot-seeded results are flagged stale so callers can tell a cached
     // cold-start answer from one this process computed live.
-    return cache.stale ? { ...cache.result, stale: true } : cache.result;
+    return hit.stale ? { ...hit.result, stale: true } : hit.result;
   }
-  if (inflight) return inflight; // several polls at once share one set of model calls
+  const pending = inflight.get(version);
+  if (pending && !opts.force) return pending; // concurrent polls share one set of calls
 
-  inflight = (async () => {
+  const run = (async () => {
     try {
       const { choices, note } = await chooseAll(persona);
       const result = buildProjection(persona, HORIZON, choices, {
@@ -155,11 +169,12 @@ export async function getProjection(opts: { force?: boolean } = {}): Promise<Pro
         generatedAt: new Date().toISOString(),
         note,
       });
-      cache = { version, result, stale: false };
+      cache.set(version, { version, result, stale: false });
       return result;
     } finally {
-      inflight = null;
+      inflight.delete(version);
     }
   })();
-  return inflight;
+  inflight.set(version, run);
+  return run;
 }
