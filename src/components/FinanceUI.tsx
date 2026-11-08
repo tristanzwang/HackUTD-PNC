@@ -1,7 +1,7 @@
 "use client";
 
 import { useEffect, useState, useSyncExternalStore } from "react";
-import type { FinanceScene } from "@/lib/finance/graph-data";
+import type { FinanceScene, ForecastMode } from "@/lib/finance/graph-data";
 import { formatUSD } from "@/lib/finance/scene-bridge";
 import type { Scrub } from "@/lib/finance/scrub";
 import type { ProjectionState } from "./useProjection";
@@ -129,26 +129,110 @@ export function Scrubber({
 }
 
 /**
+ * Raw (carry-forward) vs Interpreted (Nemotron's per-category model). Flipping it
+ * retargets every planet's radius; the sim eases them to the new size. Pointless at
+ * k = 0 — history is identical either way — so it is disabled there.
+ */
+export function ForecastModeToggle({
+  scrub,
+  scene,
+  show,
+}: {
+  scrub: Scrub;
+  scene: FinanceScene;
+  show: boolean;
+}) {
+  const k = useSyncExternalStore(scrub.subscribe, scrub.get, scrub.get);
+  const [mode, setMode] = useState<ForecastMode>("interpreted");
+  const disabled = k <= 0;
+
+  // a fresh projection rebuilds the scene back on "interpreted"; keep it in step
+  useEffect(() => {
+    scene.setMode(mode);
+  }, [scene, mode]);
+
+  const choose = (m: ForecastMode) => {
+    if (disabled) return;
+    setMode(m);
+    scene.setMode(m); // the frame loop reads this next tick; planets resize smoothly
+  };
+
+  const tabs: { id: ForecastMode; label: string }[] = [
+    { id: "raw", label: "Raw" },
+    { id: "interpreted", label: "Interpreted" },
+  ];
+
+  return (
+    <div
+      inert={!show || disabled}
+      className={
+        "absolute bottom-[5.75rem] left-1/2 w-[min(34rem,calc(100vw-9rem))] -translate-x-1/2 select-none " +
+        "rounded-[1.25rem] px-3 py-2 text-white " +
+        GLASS +
+        " " +
+        materialize(show) +
+        (disabled ? " opacity-40" : "")
+      }
+    >
+      <div role="tablist" aria-label="Forecast source" className="flex gap-1">
+        {tabs.map((t) => {
+          const active = mode === t.id;
+          return (
+            <button
+              key={t.id}
+              role="tab"
+              aria-selected={active}
+              disabled={disabled}
+              onClick={() => choose(t.id)}
+              className={
+                "flex-1 rounded-full px-3 py-1 text-sm transition-colors " +
+                (active ? "bg-white/20 text-white" : "text-white/55 hover:text-white/85") +
+                " " +
+                PRESS +
+                " " +
+                FOCUS +
+                (disabled ? " cursor-not-allowed" : "")
+              }
+            >
+              {t.label}
+            </button>
+          );
+        })}
+      </div>
+      <p className="mt-1.5 px-1 text-[0.78rem] leading-snug text-white/45">
+        Raw = carry-forward. Interpreted = Nemotron-selected model per category.
+      </p>
+    </div>
+  );
+}
+
+/**
  * A small pill saying what is reading the user's history: whether Nemotron or the
  * built-in rules chose the forecasts, how much history it has seen, and when.
  */
 export function AgentStatus({ state }: { state: ProjectionState }) {
   const { data, error, loading } = state;
   let dot = "bg-white/40";
+  let hideDot = false;
   let text = "Reading your history…";
   let title = "";
   if (data) {
     const n = data.months.length;
-    dot = data.agent.live ? "bg-emerald-300" : "bg-amber-300";
-    text = data.agent.live
-      ? `Nemotron · ${n} months read`
-      : `Built-in rules · ${n} months read`;
+    if (data.agent.live) {
+      hideDot = true; // no status dot for the healthy Nemotron state
+      text = `Nemotron ${n} months read`; // and no middle dot
+    } else {
+      dot = "bg-amber-300";
+      text = `Built-in rules · ${n} months read`;
+    }
     title =
       (data.agent.note ? data.agent.note + "\n" : "") +
+      (data.stale ? "Pre-built snapshot; a fresh forecast is loading.\n" : "") +
       `Updated ${new Date(data.generatedAt).toLocaleTimeString()}`;
   }
   if (error) {
     dot = "bg-rose-300";
+    hideDot = false;
     text = data ? "Offline · showing last forecast" : "Couldn’t load forecasts";
     title = error;
   } else if (!data && !loading) {
@@ -164,8 +248,15 @@ export function AgentStatus({ state }: { state: ProjectionState }) {
         GLASS
       }
     >
-      <span className={"h-2 w-2 rounded-full " + dot + (loading ? " animate-pulse" : "")} />
+      {!hideDot && (
+        <span className={"h-2 w-2 rounded-full " + dot + (loading ? " animate-pulse" : "")} />
+      )}
       {text}
+      {data?.stale && (
+        <span className="rounded-full bg-white/10 px-1.5 py-0.5 text-[0.7rem] uppercase tracking-wide text-white/55">
+          cached
+        </span>
+      )}
     </div>
   );
 }

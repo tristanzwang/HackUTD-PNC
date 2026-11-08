@@ -39,7 +39,7 @@ import { formatUSD } from "@/lib/finance/scene-bridge";
 import { Scrub } from "@/lib/finance/scrub";
 import { gridToWorldSurface } from "@/lib/units";
 import CategoryPanel from "./CategoryPanel";
-import { AgentStatus, Scrubber } from "./FinanceUI";
+import { AgentStatus, ForecastModeToggle, Scrubber } from "./FinanceUI";
 import SurfacePanel from "./SurfacePanel";
 import { useProjection } from "./useProjection";
 import { CHIP, FOCUS, GLASS, PRESS, collapsible } from "./ui";
@@ -1359,6 +1359,7 @@ export default function FluidScene() {
       )}
 
       {scene && <Scrubber scrub={scrub} scene={scene} show={!inGraph} />}
+      {scene && <ForecastModeToggle scrub={scrub} scene={scene} show={!inGraph} />}
       <AgentStatus state={projection} />
     </div>
   );

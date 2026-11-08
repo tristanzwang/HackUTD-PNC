@@ -36,6 +36,8 @@ export type CategoryProjection = {
   history: number[];
   /** `horizon` months after the last history month, with an ~80% range. */
   forecast: { value: number; lo: number; hi: number }[];
+  /** The same horizon under plain carry-forward (naive), so the UI can show what the model changed. */
+  baseline: { value: number; lo: number; hi: number }[];
   model: ModelInfo;
   /** Plain-language reading of where this is heading, built from the numbers. */
   insight: string;
@@ -61,6 +63,8 @@ export type Projection = {
   horizon: number;
   categories: CategoryProjection[];
   summary: Summary;
+  /** `summary` recomputed from the carry-forward baselines, for a before/after comparison. */
+  baselineSummary: Summary;
   agent: {
     /** True when Nemotron picked at least one model; false = every pick was the local heuristic. */
     live: boolean;
@@ -206,6 +210,12 @@ export function buildProjection(
       lo,
       hi,
     }));
+    // the same horizon under plain carry-forward, as a "what did the model change?" reference
+    const baseline = project(fit(y, { kind: "naive" }), horizon).map(({ value, lo, hi }) => ({
+      value: Math.max(0, value),
+      lo,
+      hi,
+    }));
     const now = y[y.length - 1];
     const last = forecast[forecast.length - 1];
     return {
@@ -214,6 +224,7 @@ export function buildProjection(
       kind: spec.kind,
       history: y,
       forecast,
+      baseline,
       model: {
         kind: choice.spec.kind,
         period: choice.spec.period,
@@ -226,20 +237,26 @@ export function buildProjection(
     };
   });
 
-  const at = (key: CategoryKey, k: number) => {
+  // k = 0 is today (history), identical for both; k >= 1 reads the chosen horizon.
+  const reader = (which: "forecast" | "baseline") => (key: CategoryKey, k: number) => {
     const c = categories.find((x) => x.key === key);
     if (!c) return 0;
-    return k === 0 ? c.history[c.history.length - 1] : c.forecast[k - 1].value;
+    return k === 0 ? c.history[c.history.length - 1] : c[which][k - 1].value;
   };
-  const summary: Summary = { netWorth: [], surplus: [], assets: [], debt: [] };
-  for (let k = 0; k <= horizon; k++) {
-    const assets = ASSETS.reduce((a, key) => a + at(key, k), 0);
-    const debt = at("card", k);
-    summary.assets.push(assets);
-    summary.debt.push(debt);
-    summary.netWorth.push(assets - debt);
-    summary.surplus.push(at("income", k) - SPENDING.reduce((a, key) => a + at(key, k), 0));
-  }
+  const summarize = (at: (key: CategoryKey, k: number) => number): Summary => {
+    const s: Summary = { netWorth: [], surplus: [], assets: [], debt: [] };
+    for (let k = 0; k <= horizon; k++) {
+      const assets = ASSETS.reduce((a, key) => a + at(key, k), 0);
+      const debt = at("card", k);
+      s.assets.push(assets);
+      s.debt.push(debt);
+      s.netWorth.push(assets - debt);
+      s.surplus.push(at("income", k) - SPENDING.reduce((a, key) => a + at(key, k), 0));
+    }
+    return s;
+  };
+  const summary = summarize(reader("forecast"));
+  const baselineSummary = summarize(reader("baseline"));
 
   const live = categories.some((c) => c.model.source === "nemotron");
   return {
@@ -251,6 +268,7 @@ export function buildProjection(
     horizon,
     categories,
     summary,
+    baselineSummary,
     agent: { live, note: meta.note },
     stale: false,
   };

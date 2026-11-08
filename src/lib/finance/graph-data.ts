@@ -33,6 +33,8 @@ export const PLANET_MIN = 0.14;
 /** Months of history drawn to the left of "today". */
 export const HISTORY_WINDOW = 24;
 
+export type ForecastMode = "interpreted" | "raw";
+
 export type FinanceGraph = SceneCategory & {
   cat: CategoryProjection;
   /** The ribbon, in grid units (0-100 on x and z, height on the y axis). */
@@ -59,6 +61,9 @@ export type FinanceScene = {
   monthAt: (k: number) => string;
   /** Net worth, surplus, assets and debt for k = 0 (today) .. horizon. */
   summary: Summary;
+  /** "interpreted" = per-category model picks; "raw" = carry-forward. Drives radiusAt. */
+  mode: ForecastMode;
+  setMode: (m: ForecastMode) => void;
 };
 
 const lerp = (a: number, b: number, t: number) => a + (b - a) * t;
@@ -79,14 +84,18 @@ export function buildFinanceScene(p: Projection): FinanceScene {
   const N = hist + p.horizon;
   const today = hist - 1; // index of the last history month along the time axis
 
+  // flipped by the Raw/Interpreted control; radiusAt below reads it live each frame
+  let mode: ForecastMode = "interpreted";
+
   // dollars along the whole time axis, per category
-  const series = new Map<string, { mid: number[]; lo: number[]; hi: number[] }>();
+  const series = new Map<string, { mid: number[]; lo: number[]; hi: number[]; base: number[] }>();
   for (const c of p.categories) {
     const h = c.history.slice(-hist);
     series.set(c.key, {
       mid: [...h, ...c.forecast.map((f) => f.value)],
       lo: [...h, ...c.forecast.map((f) => f.lo)],
       hi: [...h, ...c.forecast.map((f) => f.hi)],
+      base: [...h, ...c.baseline.map((f) => f.value)],
     });
   }
 
@@ -112,6 +121,7 @@ export function buildFinanceScene(p: Projection): FinanceScene {
     const hHi = s.hi.map((v) => heightForAmount(v, largest));
     // everything from today onward, so index k = months from now
     const midNow = s.mid.slice(today);
+    const baseNow = s.base.slice(today);
     const loNow = s.lo.slice(today);
     const hiNow = s.hi.slice(today);
 
@@ -138,7 +148,8 @@ export function buildFinanceScene(p: Projection): FinanceScene {
       amountAt: (k) => sample(midNow, k),
       rangeAt: (k) => ({ lo: sample(loNow, k), hi: sample(hiNow, k) }),
       radiusAt: (k) => {
-        const r = PLANET_MAX * Math.cbrt(Math.max(sample(midNow, k), 0) / biggest);
+        const pick = mode === "raw" ? baseNow : midNow;
+        const r = PLANET_MAX * Math.cbrt(Math.max(sample(pick, k), 0) / biggest);
         return Math.min(Math.max(r, PLANET_MIN), PLANET_MAX);
       },
     });
@@ -157,6 +168,12 @@ export function buildFinanceScene(p: Projection): FinanceScene {
     todayFraction: today / (N - 1),
     labels: { x, y, z },
     summary: p.summary,
+    get mode() {
+      return mode;
+    },
+    setMode: (m) => {
+      mode = m;
+    },
     monthAt: (k) => {
       const i = Math.round(k);
       return i <= 0 ? p.months[p.months.length - 1] : p.futureMonths[Math.min(i, p.horizon) - 1];
