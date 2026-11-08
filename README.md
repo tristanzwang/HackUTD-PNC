@@ -1,6 +1,6 @@
 # <HackUTD 2026>
 
-HackUTD 2026. Setup in progress.
+The Sleeping Bags present: Orbit! We want fluid predictions to keep your finances in orbit. 
 
 ## Getting Started
 
@@ -10,4 +10,3 @@ This app is a [Next.js](https://nextjs.org) project. Run the development server:
 npm run dev
 ```
 
-Open [http://localhost:3000](http://localhost:3000) in your browser. Edit `src/app/page.tsx` to change the page.
