@@ -90,6 +90,8 @@ export type Companion = {
   /** Call when the chat window opens: the overseer briefs Pluto, and Pluto says hello. */
   open: () => Promise<void>;
   send: (text: string) => Promise<void>;
+  /** Empty the conversation (what Pluto has learned stays), and Pluto says hello again. */
+  clearChat: () => Promise<void>;
   forgetFact: (id: string) => void;
   forgetPlan: (id: string) => void;
   forgetAll: () => void;
@@ -254,6 +256,14 @@ export function useCompanion(actions: SceneActions): Companion {
     [commit, learn],
   );
 
+  const clearChat = useCallback(async () => {
+    if (sending.current || opening.current) return; // not mid-turn
+    setError(null);
+    setNotice(null);
+    commit({ ...latest.current, messages: [] });
+    await open(); // an empty chat gets a fresh hello
+  }, [commit, open]);
+
   // Agency: everything learned can be seen and removed. Removing a plan changes the forecast.
   const forgetFact = useCallback(
     (id: string) => {
@@ -284,6 +294,7 @@ export function useCompanion(actions: SceneActions): Companion {
     notice,
     open,
     send,
+    clearChat,
     forgetFact,
     forgetPlan,
     forgetAll,

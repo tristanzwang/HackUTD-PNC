@@ -261,8 +261,26 @@ export default function ChatPanel({
       </div>
 
       {/* what the overseer just did */}
-      <div className="min-h-[1.25rem] px-5 text-[0.9rem] italic text-white/50" aria-live="polite">
-        {busy === "learning" ? "Updating what I know…" : notice}
+      <div className="flex min-h-[1.25rem] items-center gap-3 px-5 text-[0.9rem]">
+        <span className="min-w-0 flex-1 italic text-white/50" aria-live="polite">
+          {busy === "learning" ? "Updating what I know…" : notice}
+        </span>
+        {messages.length > 0 && (
+          <button
+            onClick={() => companion.clearChat()}
+            disabled={busy === "thinking"}
+            title="Clear this conversation (what Pluto has learned stays)"
+            className={
+              "shrink-0 rounded-full px-2.5 py-0.5 text-white/55 enabled:hover:bg-white/10 " +
+              "enabled:hover:text-white disabled:opacity-35 " +
+              PRESS +
+              " " +
+              FOCUS
+            }
+          >
+            Clear chat
+          </button>
+        )}
       </div>
 
       {/* input */}
