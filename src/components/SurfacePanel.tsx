@@ -5,7 +5,7 @@ import { compileSurface, type SurfaceFn } from "@/lib/expression";
 import type { FluidEntry } from "@/lib/fluid-config";
 import { analyzeSurface as analyze, adviceFor } from "@/lib/surface-analysis";
 import { AXIS_MAX, gridToWorldSurface } from "@/lib/units";
-import { Divider, Orb, roman } from "./Ornaments";
+import { Divider, Orb } from "./Ornaments";
 import { CHIP, CHIP_ON, FOCUS, GLASS, PRESS, materialize } from "./ui";
 
 // x and z run 0..100 across the floor of the grid; the result is the surface's height on the y axis (0..100)
@@ -52,7 +52,7 @@ function drawPreview(canvas: HTMLCanvasElement, fn: SurfaceFn) {
   g.putImageData(img, 0, 0);
 }
 
-/** Expression box, presets and live preview for one fluid's surface graph. */
+/** Expression box, presets and live preview for one graph's surface. */
 function SurfaceEditor({
   initialExpr,
   onApply,
@@ -159,8 +159,8 @@ function SurfaceEditor({
         <span>{AXIS_MAX}</span>
       </div>
       <p className="mt-2 text-sm leading-snug text-white/35">
-        Top-down view of the grid floor (x and z run 0–{AXIS_MAX}); colour is height. The water fills up to
-        the graph, and the number of points follows the volume under it. Use x, z, pi, e, + − * / ^ and
+        Top-down view of the grid floor (x and z run 0–{AXIS_MAX}); colour is height. The points fill up to
+        the graph, and their number follows the volume under it. Use x, z, pi, e, + − * / ^ and
         sin, cos, sqrt, exp, abs, min, max…
       </p>
     </div>
@@ -204,7 +204,7 @@ export default function SurfacePanel({
   return (
     <aside
       inert={!open}
-      aria-label={`Fluid ${number} settings`}
+      aria-label={`Graph ${number} settings`}
       className={
         "absolute right-5 top-[4.9rem] max-h-[calc(100vh-9.5rem)] w-80 origin-top-right select-none " +
         "overflow-y-auto rounded-[1.25rem] p-5 text-white [scrollbar-width:thin] " +
@@ -217,13 +217,13 @@ export default function SurfacePanel({
         <Orb color={fluid.color} size={22} />
         <div className="min-w-0 flex-1">
           <h2 className="text-xl font-semibold italic leading-none tracking-[-0.01em] text-white">
-            Fluid {roman(number)}
+            Graph {number}
           </h2>
           <p className="mt-1 text-sm text-white/45">{fluid.sim.count} points</p>
         </div>
         <button
           onClick={onClose}
-          aria-label="Close fluid settings"
+          aria-label="Close graph settings"
           className={"flex h-7 w-7 items-center justify-center rounded-full text-white/55 hover:bg-white/10 hover:text-white " + PRESS + " " + FOCUS}
         >
           <svg width="12" height="12" viewBox="0 0 12 12" aria-hidden>
@@ -236,12 +236,12 @@ export default function SurfacePanel({
 
       <div className="relative flex items-center justify-between gap-2">
         <label className="flex items-center gap-2.5 text-sm text-white/65">
-          Hue
+          Colour
           <input
             type="color"
             value={fluid.color}
             onChange={(e) => onColor(fluid.id, e.target.value)}
-            aria-label={`Colour of fluid ${number}`}
+            aria-label={`Colour of graph ${number}`}
             className={"h-6 w-9 cursor-pointer rounded-md border border-white/30 bg-transparent p-0 " + FOCUS}
           />
         </label>
@@ -250,7 +250,7 @@ export default function SurfacePanel({
           disabled={!canRemove}
           className={"px-3.5 py-1 text-sm enabled:hover:border-red-300/40 enabled:hover:bg-red-500/20 enabled:hover:text-red-100 disabled:opacity-35 " + PRESS + " " + FOCUS + " " + CHIP}
         >
-          Dissolve
+          Remove
         </button>
       </div>
 

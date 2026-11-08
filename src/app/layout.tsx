@@ -12,8 +12,8 @@ const serif = Cormorant_Garamond({
 });
 
 export const metadata: Metadata = {
-  title: "3D Fluid Simulation",
-  description: "Splash around in an interactive 3D fluid simulation.",
+  title: "3D Graphs",
+  description: "Plot and explore interactive 3D graphs.",
 };
 
 export default function RootLayout({ children }: LayoutProps<"/">) {

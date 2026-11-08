@@ -188,13 +188,13 @@ export function compileSurface(source: string): CompileResult {
   if (!src.trim()) return { ok: false, error: "enter an expression in x and z" };
   try {
     const node = parse(tokenize(src));
-    // reject expressions that never produce a usable number over the tank footprint
+    // reject expressions that never produce a usable number over the graph footprint
     let finite = 0;
     for (let i = 0; i <= 8; i++)
       for (let k = 0; k <= 8; k++) {
         if (Number.isFinite(node(i * 12.5, k * 12.5))) finite++;
       }
-    if (finite === 0) return { ok: false, error: "expression has no valid values over the tank" };
+    if (finite === 0) return { ok: false, error: "expression has no valid values over the graph" };
     return { ok: true, fn: node };
   } catch (e) {
     return { ok: false, error: e instanceof Error ? e.message : "invalid expression" };

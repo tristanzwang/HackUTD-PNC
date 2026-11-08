@@ -3,7 +3,7 @@ import { AXIS_MAX, MAX_SURFACE_UNITS } from "./units";
 
 const CLIP_LABEL = String(Math.round(MAX_SURFACE_UNITS));
 
-/** Height range of a grid-unit graph, and how many wiggles it has (to warn about shapes the fluid can't show). */
+/** Height range of a grid-unit graph, and how many wiggles it has (to warn about shapes the points can't show). */
 export function analyzeSurface(fn: SurfaceFn) {
   const N = 25;
   let min = Infinity;
@@ -42,11 +42,11 @@ export function analyzeSurface(fn: SurfaceFn) {
 /** The most useful hint for why a graph might not look like what was typed. */
 export function adviceFor(stats: ReturnType<typeof analyzeSurface>): string | null {
   if (stats.max < 1.5)
-    return "Height near 0: almost no fluid. The number of points follows the volume under the graph.";
+    return "Height near 0: almost no points. The number of points follows the volume under the graph.";
   if (stats.extrema > 10)
-    return "Very fine detail: ripples shorter than about 15 units are too small for the fluid to follow. Divide x and z, e.g. sin(x/15).";
+    return "Very fine detail: ripples shorter than about 15 units are too small for the points to follow. Divide x and z, e.g. sin(x/15).";
   if (stats.max > MAX_SURFACE_UNITS)
-    return `Heights above ${CLIP_LABEL} are clipped to the top of the tank.`;
-  if (stats.min < 0) return "Heights below 0 are treated as 0 (no fluid there).";
+    return `Heights above ${CLIP_LABEL} are clipped to the top of the graph.`;
+  if (stats.min < 0) return "Heights below 0 are treated as 0 (no points there).";
   return null;
 }
