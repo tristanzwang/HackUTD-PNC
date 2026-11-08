@@ -44,8 +44,20 @@ export function createCoordinateGrid(
   { divisions = 10, labelEvery = 20, units = 100 } = {},
 ) {
   const group = new THREE.Group();
-  const gridMat = new THREE.LineBasicMaterial({ color: "#3a5190", transparent: true, opacity: 0.45 });
-  const floorMat = new THREE.LineBasicMaterial({ color: "#4a64ad", transparent: true, opacity: 0.55 });
+  // every material, with the opacity it has when the grid is fully shown, so the
+  // whole grid can fade out as the view turns into a solar system
+  const fades: { mat: THREE.Material & { opacity: number }; full: number }[] = [];
+  const track = <T extends THREE.Material & { opacity: number }>(mat: T) => {
+    mat.transparent = true;
+    fades.push({ mat, full: mat.opacity });
+    return mat;
+  };
+  const gridMat = track(
+    new THREE.LineBasicMaterial({ color: "#3a5190", transparent: true, opacity: 0.45 }),
+  );
+  const floorMat = track(
+    new THREE.LineBasicMaterial({ color: "#4a64ad", transparent: true, opacity: 0.55 }),
+  );
 
   const lerp = (a: number, b: number, t: number) => a + (b - a) * t;
   const fr = Array.from({ length: divisions + 1 }, (_, i) => i / divisions);
@@ -76,7 +88,7 @@ export function createCoordinateGrid(
   const axis = (to: [number, number, number], color: string) =>
     new THREE.LineSegments(
       lineGeometry([box.minX, box.minY, box.minZ, ...to]),
-      new THREE.LineBasicMaterial({ color }),
+      track(new THREE.LineBasicMaterial({ color, transparent: true, opacity: 1 })),
     );
   group.add(
     axis([box.maxX, box.minY, box.minZ], COLORS.x),
@@ -92,6 +104,7 @@ export function createCoordinateGrid(
 
   const put = (text: string, color: string, x: number, y: number, z: number, scale = 0.8) => {
     const s = makeLabel(text, color, scale);
+    track(s.material);
     s.position.set(x, y, z);
     group.add(s);
   };
@@ -105,5 +118,13 @@ export function createCoordinateGrid(
   put("z", COLORS.z, box.minX - off, ly, box.maxZ + 0.14, 1.4);
   put("y", COLORS.y, box.minX - off, box.maxY + 0.12, box.minZ - off, 1.4);
 
-  return { group };
+  return {
+    group,
+    /** Fade the whole grid (1 = fully shown, 0 = gone). */
+    setOpacity(k: number) {
+      group.visible = k > 0.002;
+      if (!group.visible) return;
+      for (const f of fades) f.mat.opacity = f.full * k;
+    },
+  };
 }

@@ -16,6 +16,12 @@ export const TANK = {
 };
 
 const MAX_NEIGHBORS = 80;
+/**
+ * Largest span the spatial hash has to cover: the tank, or a ball of fluid plus
+ * its shell. The grid is this big and *follows the fluid*, so a planet works the
+ * same whether it sits in the tank or orbits far away from it.
+ */
+const MAX_EXTENT = 3.4;
 
 /** Surface-height grid: resolution over the tank footprint, height clip and slope clip. */
 const SURF_N = 49;
@@ -24,8 +30,12 @@ export const MAX_SURFACE_HEIGHT = TANK.maxY - 0.05;
 const MAX_SLOPE = 1.2;
 const WALL_MARGIN = 0.02; // particles are kept this far inside the walls
 const INTERIOR_AREA = (TANK.maxX - TANK.minX - 2 * WALL_MARGIN) * (TANK.maxZ - TANK.minZ - 2 * WALL_MARGIN);
+/** Volume a settled particle occupies, as a multiple of spacing^3 (see DEPTH_K1). */
+const SETTLED_VOLUME = 1.2;
 /** Never fewer nodes than this, so a near-zero graph still shows a thin sheet of fluid. */
 const MIN_NODES = 60;
+/** Most stretched links drawn from any one pinned particle. */
+const STRETCH_LINKS = 8;
 /**
  * Settled depth of a column of fluid whose particles would fill nominal depth x
  * at spacing^3 each: top = K1*x - K2*x^3. K1 > 1 because settled particles sit a
@@ -65,6 +75,12 @@ export class FluidSim {
   private surfGX = new Float32Array(SURF_N * SURF_N);
   private surfGZ = new Float32Array(SURF_N * SURF_N);
   private hasTilt = false;
+  /** How many particles are currently pinned (0 = skip all the stuck-point work). */
+  pinnedCount = 0;
+  /** How strongly fluid clings to nearby pinned points, pulling the surface into a hill. */
+  pinnedCohesion = 4;
+  private nearIdx = new Int32Array(STRETCH_LINKS);
+  private nearD2 = new Float32Array(STRETCH_LINKS);
   private held: number[] = [];
   private heldOff: number[] = [];
   private heldMin = [0, 0, 0];
@@ -73,12 +89,26 @@ export class FluidSim {
 
   private rho0 = 1;
   gravity = 7;
+  /**
+   * 0 = the fluid lies in the tank under ordinary gravity; 1 = it is pulled
+   * into a ball around (orbitX, orbitY, orbitZ) with the tank walls gone.
+   * Values in between blend the two, which is what the view transition rides on.
+   */
+  orbitBlend = 0;
+  /** Pull toward the gravity point when orbitBlend is 1. */
+  orbitGravity = 9;
+  orbitX = 0;
+  orbitY = 0;
+  orbitZ = 0;
   stiffness = 30;
   stiffnessNear = 60;
   viscosity = 0.15;
   maxSpeed = 7;
 
-  // spatial hash
+  // spatial hash (a fixed-size grid whose origin follows the fluid)
+  private originX = 0;
+  private originY = 0;
+  private originZ = 0;
   private cellSize = 0.2;
   private gx = 1;
   private gy = 1;
@@ -115,10 +145,9 @@ export class FluidSim {
     this.stiffness = 30 * (spacing / 0.082);
     this.stiffnessNear = 60 * (spacing / 0.082);
     this.cellSize = this.h;
-    this.gx = Math.ceil((TANK.maxX - TANK.minX) / this.cellSize) + 1;
-    this.gy = Math.ceil((TANK.maxY - TANK.minY) / this.cellSize) + 1;
-    this.gz = Math.ceil((TANK.maxZ - TANK.minZ) / this.cellSize) + 1;
-    this.cellStart = new Int32Array(this.gx * this.gy * this.gz + 1);
+    const dim = Math.ceil(MAX_EXTENT / this.cellSize) + 2;
+    this.gx = this.gy = this.gz = dim;
+    this.cellStart = new Int32Array(dim * dim * dim + 1);
     this.calibrate();
   }
 
@@ -157,6 +186,7 @@ export class FluidSim {
     }
     this.vel.fill(0);
     this.unpinAll();
+    this.buildNeighbors();
   }
 
   /**
@@ -255,9 +285,9 @@ export class FluidSim {
   }
 
   private cellIndex(x: number, y: number, z: number) {
-    let cx = Math.floor((x - TANK.minX) / this.cellSize);
-    let cy = Math.floor((y - TANK.minY) / this.cellSize);
-    let cz = Math.floor((z - TANK.minZ) / this.cellSize);
+    let cx = Math.floor((x - this.originX) / this.cellSize);
+    let cy = Math.floor((y - this.originY) / this.cellSize);
+    let cz = Math.floor((z - this.originZ) / this.cellSize);
     cx = cx < 0 ? 0 : cx >= this.gx ? this.gx - 1 : cx;
     cy = cy < 0 ? 0 : cy >= this.gy ? this.gy - 1 : cy;
     cz = cz < 0 ? 0 : cz >= this.gz ? this.gz - 1 : cz;
@@ -266,6 +296,18 @@ export class FluidSim {
 
   private buildNeighbors() {
     const { count: n, pos, cellStart, cellItems, cellOf, gx, gy, gz, h } = this;
+    if (n === 0) return;
+    // park the grid on the fluid's own bounding box, wherever in space it is
+    let mnx = Infinity, mny = Infinity, mnz = Infinity;
+    for (let i = 0; i < n; i++) {
+      if (pos[i * 3] < mnx) mnx = pos[i * 3];
+      if (pos[i * 3 + 1] < mny) mny = pos[i * 3 + 1];
+      if (pos[i * 3 + 2] < mnz) mnz = pos[i * 3 + 2];
+    }
+    this.originX = mnx - this.cellSize;
+    this.originY = mny - this.cellSize;
+    this.originZ = mnz - this.cellSize;
+
     cellStart.fill(0);
     for (let i = 0; i < n; i++) {
       const c = this.cellIndex(pos[i * 3], pos[i * 3 + 1], pos[i * 3 + 2]);
@@ -309,15 +351,31 @@ export class FluidSim {
 
     // gravity
     const pinned = this.pinned;
-    const g = this.gravity * dt;
+    const b = this.orbitBlend;
+    const down = this.gravity * dt * (1 - b);
+    const pull = this.orbitGravity * dt * b;
+    const soft = this.spacing;
     for (let i = 0; i < n; i++) {
       if (pinned[i]) continue;
-      vel[i * 3 + 1] -= g;
-      if (this.hasTilt) {
-        // tilt gravity to be perpendicular to the shaped surface
-        const px = pos[i * 3], pz = pos[i * 3 + 2];
-        vel[i * 3] += g * this.sampleSurface(this.surfGX, px, pz);
-        vel[i * 3 + 2] += g * this.sampleSurface(this.surfGZ, px, pz);
+      if (down > 0) {
+        vel[i * 3 + 1] -= down;
+        if (this.hasTilt) {
+          // tilt gravity to be perpendicular to the shaped surface
+          const px = pos[i * 3], pz = pos[i * 3 + 2];
+          vel[i * 3] += down * this.sampleSurface(this.surfGX, px, pz);
+          vel[i * 3 + 2] += down * this.sampleSurface(this.surfGZ, px, pz);
+        }
+      }
+      if (pull > 0) {
+        // fall toward the gravity point, which is what balls the fluid up
+        const dx = this.orbitX - pos[i * 3];
+        const dy = this.orbitY - pos[i * 3 + 1];
+        const dz = this.orbitZ - pos[i * 3 + 2];
+        const r = Math.sqrt(dx * dx + dy * dy + dz * dz);
+        const f = pull / Math.max(r, soft);
+        vel[i * 3] += dx * f;
+        vel[i * 3 + 1] += dy * f;
+        vel[i * 3 + 2] += dz * f;
       }
     }
 
@@ -342,6 +400,29 @@ export class FluidSim {
           const I = 0.5 * q * this.viscosity * u;
           vel[i * 3] -= I * nx; vel[i * 3 + 1] -= I * ny; vel[i * 3 + 2] -= I * nz;
           vel[j * 3] += I * nx; vel[j * 3 + 1] += I * ny; vel[j * 3 + 2] += I * nz;
+        }
+      }
+    }
+
+    // Fluid clings to nearby pinned points, so a dragged blob pulls the surface
+    // up (or down) with it instead of leaving a clean hole behind.
+    if (this.pinnedCount > 0 && this.pinnedCohesion > 0) {
+      const a = this.pinnedCohesion * dt;
+      for (let i = 0; i < n; i++) {
+        if (pinned[i]) continue;
+        const base = i * MAX_NEIGHBORS;
+        for (let k = 0; k < nbrCount[i]; k++) {
+          const j = nbrs[base + k];
+          if (!pinned[j]) continue;
+          const dx = pos[j * 3] - pos[i * 3];
+          const dy = pos[j * 3 + 1] - pos[i * 3 + 1];
+          const dz = pos[j * 3 + 2] - pos[i * 3 + 2];
+          const r = Math.sqrt(dx * dx + dy * dy + dz * dz);
+          if (r < 1e-6) continue;
+          const f = (a * (1 - r / h)) / r;
+          vel[i * 3] += dx * f;
+          vel[i * 3 + 1] += dy * f;
+          vel[i * 3 + 2] += dz * f;
         }
       }
     }
@@ -395,16 +476,35 @@ export class FluidSim {
     }
 
     // tank walls
-    const m = 0.02;
+    const m = WALL_MARGIN;
+    // Both walls are applied as a weighted move toward the clamped position, so
+    // the tank dissolves and the ball's shell forms smoothly across a transition.
+    const keep = 1 - b; // weight of the tank walls
+    const shell = b > 0 ? this.ballRadius * 1.6 : 0;
     for (let i = 0; i < n; i++) {
       if (pinned[i]) continue;
       const j = i * 3;
-      if (pos[j] < TANK.minX + m) pos[j] = TANK.minX + m;
-      else if (pos[j] > TANK.maxX - m) pos[j] = TANK.maxX - m;
-      if (pos[j + 1] < TANK.minY + m) pos[j + 1] = TANK.minY + m;
-      else if (pos[j + 1] > TANK.maxY - m) pos[j + 1] = TANK.maxY - m;
-      if (pos[j + 2] < TANK.minZ + m) pos[j + 2] = TANK.minZ + m;
-      else if (pos[j + 2] > TANK.maxZ - m) pos[j + 2] = TANK.maxZ - m;
+      if (keep > 0) {
+        const cx = Math.min(Math.max(pos[j], TANK.minX + m), TANK.maxX - m);
+        const cy = Math.min(Math.max(pos[j + 1], TANK.minY + m), TANK.maxY - m);
+        const cz = Math.min(Math.max(pos[j + 2], TANK.minZ + m), TANK.maxZ - m);
+        pos[j] += (cx - pos[j]) * keep;
+        pos[j + 1] += (cy - pos[j + 1]) * keep;
+        pos[j + 2] += (cz - pos[j + 2]) * keep;
+      }
+      if (shell > 0) {
+        // a loose shell around the gravity point, so nothing drifts off into space
+        const dx = pos[j] - this.orbitX;
+        const dy = pos[j + 1] - this.orbitY;
+        const dz = pos[j + 2] - this.orbitZ;
+        const r = Math.sqrt(dx * dx + dy * dy + dz * dz);
+        if (r > shell) {
+          const t = (b * (shell / r - 1));
+          pos[j] += dx * t;
+          pos[j + 1] += dy * t;
+          pos[j + 2] += dz * t;
+        }
+      }
     }
 
     // velocities from displacement
@@ -427,17 +527,121 @@ export class FluidSim {
     }
   }
 
+  /** Radius of the ball this fluid settles into around a gravity point. */
+  get ballRadius() {
+    const volume = this.count * this.spacing ** 3 * SETTLED_VOLUME;
+    return Math.cbrt((volume * 3) / (4 * Math.PI));
+  }
+
+  /** Move every particle rigidly, e.g. to carry a planet along its orbit. */
+  translate(dx: number, dy: number, dz: number) {
+    const { count: n, pos } = this;
+    for (let i = 0; i < n; i++) {
+      pos[i * 3] += dx;
+      pos[i * 3 + 1] += dy;
+      pos[i * 3 + 2] += dz;
+    }
+    this.orbitX += dx;
+    this.orbitY += dy;
+    this.orbitZ += dz;
+  }
+
+  /** Average particle position. */
+  centroid(out: [number, number, number]): [number, number, number] {
+    const { count: n, pos } = this;
+    out[0] = out[1] = out[2] = 0;
+    if (n === 0) return out;
+    for (let i = 0; i < n; i++) {
+      out[0] += pos[i * 3];
+      out[1] += pos[i * 3 + 1];
+      out[2] += pos[i * 3 + 2];
+    }
+    out[0] /= n;
+    out[1] /= n;
+    out[2] /= n;
+    return out;
+  }
+
   /**
-   * Collect pairs of nearby particles to draw as lattice links.
-   * Writes [a0, b0, a1, b1, ...] into `out` and returns the number of pairs.
-   * Links longer than `maxDist` are skipped, so the lattice tears apart
-   * where the fluid splashes.
+   * The (up to `k`) nearest *unpinned* particles to `i` within `radius`, nearest
+   * first. Fills `idxOut`/`d2Out` (squared distances) and returns how many were
+   * found. Pinned particles are skipped because a dragged blob's own points are
+   * always the closest ones, and would otherwise crowd out the fluid it needs to
+   * reach. Reads the spatial hash built by the last step().
    */
-  collectLinks(maxDist: number, out: Uint32Array): number {
+  private nearestFluidWithin(
+    i: number,
+    radius: number,
+    k: number,
+    idxOut: Int32Array,
+    d2Out: Float32Array,
+  ): number {
+    const { pos, pinned, cellStart, cellItems, gx, gy, gz, cellSize } = this;
+    const px = pos[i * 3], py = pos[i * 3 + 1], pz = pos[i * 3 + 2];
+    // hash the live position: a dragged point has moved since the last step
+    const c = this.cellIndex(px, py, pz);
+    const cx = c % gx;
+    const cz = Math.floor(c / gx) % gz;
+    const cy = Math.floor(c / (gx * gz));
+    const ring = Math.ceil(radius / cellSize);
+    const r2 = radius * radius;
+    let found = 0;
+    let worst = Infinity;
+    for (let oy = Math.max(cy - ring, 0); oy <= Math.min(cy + ring, gy - 1); oy++)
+      for (let oz = Math.max(cz - ring, 0); oz <= Math.min(cz + ring, gz - 1); oz++)
+        for (let ox = Math.max(cx - ring, 0); ox <= Math.min(cx + ring, gx - 1); ox++) {
+          const cc = (oy * gz + oz) * gx + ox;
+          for (let sIdx = cellStart[cc]; sIdx < cellStart[cc + 1]; sIdx++) {
+            const j = cellItems[sIdx];
+            if (j === i || pinned[j]) continue;
+            const dx = pos[j * 3] - px, dy = pos[j * 3 + 1] - py, dz = pos[j * 3 + 2] - pz;
+            const d2 = dx * dx + dy * dy + dz * dz;
+            if (d2 >= r2 || d2 >= worst) continue;
+            // keep the buffer sorted by distance, evicting the worst once it is full
+            let p = found < k ? found++ : k - 1;
+            while (p > 0 && d2Out[p - 1] > d2) {
+              d2Out[p] = d2Out[p - 1];
+              idxOut[p] = idxOut[p - 1];
+              p--;
+            }
+            d2Out[p] = d2;
+            idxOut[p] = j;
+            worst = found === k ? d2Out[k - 1] : Infinity;
+          }
+        }
+    return found;
+  }
+
+  /**
+   * Collect pairs of particles to draw as lattice links. Writes [a0, b0, a1,
+   * b1, ...] into `out` and returns the number of pairs.
+   *
+   * Ordinary fluid links are shorter than `maxDist`, so the lattice tears apart
+   * where the fluid splashes. Pinned particles additionally reach out to the
+   * nearest fluid as far as `stretchDist`, so a blob dragged out of the fluid
+   * stays joined to the surface it came from: the lattice stretches into a hill
+   * or divot instead of tearing off. For each pair, `outStretch` gets 0 for an
+   * ordinary link, or how far a stretched one is drawn out (0..1], so the
+   * renderer can fade it as it thins.
+   */
+  collectLinks(
+    maxDist: number,
+    out: Uint32Array,
+    stretchDist = 0,
+    outStretch?: Float32Array,
+  ): number {
     const { count: n, pos, nbrs, nbrCount } = this;
     const max2 = maxDist * maxDist;
     const cap = out.length >> 1;
     let pairs = 0;
+
+    const emit = (i: number, j: number, stretch: number) => {
+      out[pairs * 2] = i;
+      out[pairs * 2 + 1] = j;
+      if (outStretch) outStretch[pairs] = stretch;
+      pairs++;
+    };
+
     for (let i = 0; i < n; i++) {
       for (let k = 0; k < nbrCount[i]; k++) {
         const j = nbrs[i * MAX_NEIGHBORS + k];
@@ -447,14 +651,31 @@ export class FluidSim {
         const dz = pos[j * 3 + 2] - pos[i * 3 + 2];
         if (dx * dx + dy * dy + dz * dz > max2) continue;
         if (pairs >= cap) return pairs;
-        out[pairs * 2] = i;
-        out[pairs * 2 + 1] = j;
-        pairs++;
+        emit(i, j, 0);
+      }
+    }
+
+    // stretched links, from the pinned points outward
+    if (this.pinnedCount === 0 || stretchDist <= maxDist) return pairs;
+    const span = stretchDist - maxDist;
+    for (let i = 0; i < n; i++) {
+      if (!this.pinned[i]) continue;
+      const found = this.nearestFluidWithin(
+        i,
+        stretchDist,
+        STRETCH_LINKS,
+        this.nearIdx,
+        this.nearD2,
+      );
+      for (let k = 0; k < found; k++) {
+        const d = Math.sqrt(this.nearD2[k]);
+        if (d <= maxDist) continue; // the pass above already drew this one
+        if (pairs >= cap) return pairs;
+        emit(i, this.nearIdx[k], (d - maxDist) / span);
       }
     }
     return pairs;
   }
-
 
   /**
    * Distance along a ray to the first particle within `radius` of it, or
@@ -514,6 +735,7 @@ export class FluidSim {
       if (ex * ex + ey * ey + ez * ez > g2) continue;
       this.held.push(i);
       this.heldOff.push(ex, ey, ez);
+      if (!this.pinned[i]) this.pinnedCount++;
       this.pinned[i] = 1;
       this.vel[i * 3] = this.vel[i * 3 + 1] = this.vel[i * 3 + 2] = 0;
       const off = [ex, ey, ez];
@@ -555,6 +777,7 @@ export class FluidSim {
   /** Turn every stuck point back into fluid. */
   unpinAll() {
     this.pinned.fill(0);
+    this.pinnedCount = 0;
     this.releaseGrab();
   }
 

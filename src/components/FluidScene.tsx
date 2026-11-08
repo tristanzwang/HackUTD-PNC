@@ -13,23 +13,41 @@ import {
 import { FluidSim, TANK } from "@/lib/fluid-sim";
 import type { SurfaceFn } from "@/lib/expression";
 import { OverlapField } from "@/lib/overlap";
+import { createSolarScenery } from "@/lib/solar-scenery";
+import {
+  ViewTransition,
+  clamp01,
+  easeInOutCubic,
+  orbitPosition,
+  systemRadius,
+} from "@/lib/solar-system";
 import SurfacePanel from "./SurfacePanel";
 
 const STEP = 1 / 60;
 const LINK_RATIO = 1.317; // neighbours closer than this x spacing get a lattice link
 const POINT_RATIO = 0.49; // point size relative to particle spacing
 const LINK_DIM = 0.7; // links are drawn slightly darker than the points
+// Links from pinned points stretch this much further, so a dragged blob stays
+// joined to the fluid it came from instead of tearing off.
+const STRETCH_RATIO = 7;
+const MIN_STRETCH = 0.6;
+const STRETCH_FADE = 0.82; // how far a fully stretched link fades out
 const PIN_COLOR = new THREE.Color("#ffb347"); // stuck points
 const WHITE = new THREE.Color("#ffffff");
 const BG = "#070b17";
 const DEFAULT_DIMMING = 0.6;
 const DEFAULT_OVERLAP_DIMMING = 0.6;
 const TANK_CENTER = new THREE.Vector3(0, (TANK.maxY - TANK.minY) * 0.3, 0);
+const SUN_CENTER = new THREE.Vector3(0, 0, 0);
+/** How long the tank <-> solar system transition takes. */
+const TRANSITION_SECONDS = 2.6;
 
 // cursor reach scales with a fluid's particle spacing so sparse fluids stay grabbable
 const splashRadius = (sim: FluidSim) => Math.max(0.16, 1.8 * sim.spacing);
 const grabRadius = (sim: FluidSim) => Math.max(0.22, 2.3 * sim.spacing); // size of the globule you pick up
 const grabRayRadius = (sim: FluidSim) => Math.max(0.12, 1.3 * sim.spacing);
+
+export type View = "tank" | "solar";
 
 // ---------------------------------------------------------------------------
 // rendering helpers
@@ -42,6 +60,7 @@ type LatticeBuffers = {
   linePos: THREE.BufferAttribute;
   lineCol: THREE.BufferAttribute;
   linkIdx: Uint32Array;
+  linkStretch: Float32Array;
 };
 
 let spriteTexture: THREE.CanvasTexture | null = null;
@@ -68,7 +87,7 @@ function getSprite() {
  */
 function createBuffers(sim: FluidSim): LatticeBuffers {
   const n = sim.capacity; // sim.count (active nodes) changes with the graph's volume
-  const maxLinks = n * 5;
+  const maxLinks = n * 6; // ordinary lattice links, plus the stretched ones from pinned points
 
   const pointGeo = new THREE.BufferGeometry();
   pointGeo.setAttribute("position", new THREE.BufferAttribute(sim.pos, 3));
@@ -84,7 +103,15 @@ function createBuffers(sim: FluidSim): LatticeBuffers {
   lineGeo.setAttribute("color", lineCol);
   lineGeo.setDrawRange(0, 0);
 
-  return { pointGeo, pointColors, lineGeo, linePos, lineCol, linkIdx: new Uint32Array(maxLinks * 2) };
+  return {
+    pointGeo,
+    pointColors,
+    lineGeo,
+    linePos,
+    lineCol,
+    linkIdx: new Uint32Array(maxLinks * 2),
+    linkStretch: new Float32Array(maxLinks),
+  };
 }
 
 /** Refresh point colours (fluid colour -> white with speed) and rebuild the link lines. */
@@ -97,7 +124,7 @@ function updateLattice(
   brightness: Float32Array, // per-point multiplier (dims regions where fluids overlap)
 ) {
   const { vel, pos } = sim;
-  const { pointGeo, pointColors, lineGeo, linePos, lineCol, linkIdx } = buffers;
+  const { pointGeo, pointColors, lineGeo, linePos, lineCol, linkIdx, linkStretch } = buffers;
 
   const pc = pointColors.array as Float32Array;
   for (let i = 0; i < sim.count; i++) {
@@ -115,12 +142,19 @@ function updateLattice(
   pointColors.needsUpdate = true;
   (pointGeo.getAttribute("position") as THREE.BufferAttribute).needsUpdate = true;
 
-  const links = sim.collectLinks(sim.spacing * LINK_RATIO, linkIdx);
+  const maxDist = sim.spacing * LINK_RATIO;
+  const links = sim.collectLinks(
+    maxDist,
+    linkIdx,
+    Math.max(sim.spacing * STRETCH_RATIO, MIN_STRETCH),
+    linkStretch,
+  );
   const lp = linePos.array as Float32Array;
   const lc = lineCol.array as Float32Array;
   for (let l = 0; l < links; l++) {
     const bothStuck = sim.pinned[linkIdx[l * 2]] && sim.pinned[linkIdx[l * 2 + 1]];
-    const dim = bothStuck ? 1 : LINK_DIM;
+    // a stretched link thins out the further it reaches, so the blob melts into the surface
+    const dim = (bothStuck ? 1 : LINK_DIM) * (1 - STRETCH_FADE * linkStretch[l]);
     for (let e = 0; e < 2; e++) {
       const p = linkIdx[l * 2 + e] * 3;
       const o = (l * 2 + e) * 3;
@@ -144,14 +178,14 @@ function syncDrawState(geo: THREE.BufferGeometry, mat: THREE.PointsMaterial | nu
 }
 
 /**
- * Depth dimming: fog runs from just in front of the tank to just behind it,
+ * Depth dimming: fog runs from just in front of the subject to just behind it,
  * so points far from the camera fade into the background. `amount` is 0..1.
  */
-function updateFog(scene: THREE.Scene, camDist: number, amount: number) {
+function updateFog(scene: THREE.Scene, camDist: number, amount: number, spread: number) {
   const fog = scene.fog as THREE.Fog | null;
   if (!fog) return;
-  fog.near = Math.max(camDist - 0.8, 0.1);
-  fog.far = camDist + 1.2 + (1 - amount) * 5; // amount 1 -> far points almost vanish, 0 -> barely any fade
+  fog.near = Math.max(camDist - spread * 0.5, 0.1);
+  fog.far = camDist + spread * 0.75 + (1 - amount) * spread * 3;
 }
 
 /** The fluid whose nearest particle the ray reaches first (fluids never interact; the cursor picks one). */
@@ -174,7 +208,72 @@ function pickFluid(
 }
 
 // ---------------------------------------------------------------------------
-// one fluid: steps its own simulation and draws its own points + links
+// the conductor: advances the transition, flies the planets, steps every fluid
+// ---------------------------------------------------------------------------
+
+function SimDriver({
+  fluids,
+  conductor,
+  overlap,
+  overlapDimming,
+}: {
+  fluids: FluidEntry[];
+  conductor: ViewTransition;
+  overlap: OverlapField;
+  overlapDimming: number;
+}) {
+  const acc = useRef(0);
+  const live = useRef({ fluids, overlapDimming });
+  useEffect(() => {
+    live.current = { fluids, overlapDimming };
+  }, [fluids, overlapDimming]);
+  const tmp = useMemo(() => ({ orbit: [0, 0, 0] as [number, number, number] }), []);
+
+  useFrame((_, delta) => {
+    const d = Math.min(delta, 0.05);
+    const c = conductor;
+    const { fluids: list } = live.current;
+
+    const { gather, launch } = c.advance(d, TRANSITION_SECONDS);
+    c.forget(c.p === 0 ? undefined : new Set(list.map((f) => f.id)));
+
+    list.forEach((f, i) => {
+      const sim = f.sim;
+      sim.orbitBlend = gather;
+      if (c.p === 0) return;
+
+      // the ball forms right where the water already is, then sets off
+      const { home, fresh } = c.home(f.id, () => sim.centroid([0, 0, 0]));
+      if (fresh) {
+        sim.orbitX = home[0];
+        sim.orbitY = home[1];
+        sim.orbitZ = home[2];
+        sim.unpinAll(); // stuck points would otherwise ride along frozen
+      }
+      orbitPosition(i, c.t, tmp.orbit);
+      // carry the whole planet rigidly, so orbiting never smears it
+      sim.translate(
+        home[0] + (tmp.orbit[0] - home[0]) * launch - sim.orbitX,
+        home[1] + (tmp.orbit[1] - home[1]) * launch - sim.orbitY,
+        home[2] + (tmp.orbit[2] - home[2]) * launch - sim.orbitZ,
+      );
+    });
+
+    // planets are far apart in space, so overlap dimming only makes sense in the tank
+    overlap.setAmount(live.current.overlapDimming * (1 - clamp01(c.p / 0.4)));
+
+    // fixed step; cap so a slow frame can't spiral
+    acc.current = Math.min(acc.current + d, STEP * 2);
+    while (acc.current >= STEP) {
+      for (const f of list) f.sim.step(STEP);
+      acc.current -= STEP;
+    }
+  });
+  return null;
+}
+
+// ---------------------------------------------------------------------------
+// one fluid: draws its points and links (the driver above steps it)
 // ---------------------------------------------------------------------------
 
 function FluidLayer({ fluid, overlap }: { fluid: FluidEntry; overlap: OverlapField }) {
@@ -186,7 +285,6 @@ function FluidLayer({ fluid, overlap }: { fluid: FluidEntry; overlap: OverlapFie
     const deep = new THREE.Color(color);
     return { c: new THREE.Color(), deep, foam: deep.clone().lerp(WHITE, 0.88) };
   }, [color]);
-  const acc = useRef(0);
 
   useEffect(
     () => () => {
@@ -196,13 +294,7 @@ function FluidLayer({ fluid, overlap }: { fluid: FluidEntry; overlap: OverlapFie
     [buffers],
   );
 
-  useFrame((_, delta) => {
-    // fixed step; cap so a slow frame can't spiral
-    acc.current = Math.min(acc.current + delta, STEP * 2);
-    while (acc.current >= STEP) {
-      sim.step(STEP);
-      acc.current -= STEP;
-    }
+  useFrame(() => {
     overlap.factors(sim, brightness);
     updateLattice(sim, buffers, colors.c, colors.deep, colors.foam, brightness);
     syncDrawState(buffers.pointGeo, pointsMat.current, sim);
@@ -239,40 +331,70 @@ function OverlapUpdater({ fluids, overlap }: { fluids: FluidEntry[]; overlap: Ov
 }
 
 // ---------------------------------------------------------------------------
-// the tank: fixed coordinate grid (origin corner is 0,0,0; axes run to 100)
+// scenery
 // ---------------------------------------------------------------------------
 
-function Tank() {
+/** The tank: fixed coordinate grid (origin corner is 0,0,0; axes run to 100). */
+function Tank({ conductor }: { conductor: ViewTransition }) {
   const grid = useMemo(() => createCoordinateGrid(TANK), []);
+  const edges = useRef<THREE.LineSegments>(null);
+  const edgeMat = useRef<THREE.LineBasicMaterial>(null);
   const tankW = TANK.maxX - TANK.minX;
   const tankH = TANK.maxY - TANK.minY;
-  const edges = useMemo(
+  const edgeGeo = useMemo(
     () => new THREE.EdgesGeometry(new THREE.BoxGeometry(tankW, tankH, tankW)),
     [tankW, tankH],
   );
+
+  useFrame(() => {
+    // the tank is gone well before the planets reach their orbits
+    const k = 1 - easeInOutCubic(clamp01(conductor.p / 0.6));
+    grid.setOpacity(k);
+    if (edges.current) edges.current.visible = k > 0.002;
+    if (edgeMat.current) edgeMat.current.opacity = 0.25 * k;
+  });
+
   return (
     <>
       <primitive object={grid.group} />
-      <lineSegments geometry={edges} position={[0, tankH / 2, 0]}>
-        <lineBasicMaterial color="#8fb4ff" transparent opacity={0.25} />
+      <lineSegments ref={edges} geometry={edgeGeo} position={[0, tankH / 2, 0]}>
+        <lineBasicMaterial ref={edgeMat} color="#8fb4ff" transparent opacity={0.25} />
       </lineSegments>
     </>
   );
+}
+
+/** The sun, its orbit rings and the starfield. */
+function SolarSystem({ conductor, count }: { conductor: ViewTransition; count: number }) {
+  const scenery = useMemo(() => createSolarScenery(MAX_FLUIDS), []);
+  const live = useRef(count);
+  useEffect(() => {
+    live.current = count;
+  }, [count]);
+  useEffect(() => () => scenery.dispose(), [scenery]);
+  useFrame(() => scenery.update(conductor.p, conductor.t, live.current));
+  return <primitive object={scenery.group} />;
 }
 
 // ---------------------------------------------------------------------------
 // camera, pointer input, cursor splash / grab, depth dimming
 // ---------------------------------------------------------------------------
 
-function Interaction({ fluids, dimming }: { fluids: FluidEntry[]; dimming: number }) {
+function Interaction({
+  fluids,
+  dimming,
+  conductor,
+}: {
+  fluids: FluidEntry[];
+  dimming: number;
+  conductor: ViewTransition;
+}) {
   const cursor = useRef<THREE.Mesh>(null);
   const { camera, gl, scene } = useThree();
 
-  const fluidsRef = useRef(fluids);
-  const dimRef = useRef(dimming);
+  const live = useRef({ fluids, dimming });
   useEffect(() => {
-    fluidsRef.current = fluids;
-    dimRef.current = dimming;
+    live.current = { fluids, dimming };
   }, [fluids, dimming]);
 
   const tmp = useMemo(
@@ -282,15 +404,16 @@ function Interaction({ fluids, dimming }: { fluids: FluidEntry[]; dimming: numbe
       normal: new THREE.Vector3(),
       right: new THREE.Vector3(),
       up: new THREE.Vector3(),
+      target: new THREE.Vector3(),
     }),
     [],
   );
 
   // Interaction state lives in a ref so we never re-render React per pointer event.
   const input = useRef({
-    theta: 0.7, // orbit azimuth
-    phi: 1.15, // orbit polar angle
-    dist: 3.4,
+    theta: 0.7, // orbit azimuth, shared by both views
+    phi: [1.15, 0.9], // polar angle, one per view
+    dist: [3.4, 9], // camera distance, one per view
     dragging: false,
     grabbing: false,
     grabSim: null as FluidSim | null,
@@ -304,9 +427,20 @@ function Interaction({ fluids, dimming }: { fluids: FluidEntry[]; dimming: numbe
     lastY: 0,
   });
 
+  // frame the whole system when the solar view is picked
+  useEffect(() => {
+    input.current.dist[1] = THREE.MathUtils.clamp(
+      systemRadius(fluids.length) * 1.55 + 3.2,
+      5,
+      34,
+    );
+  }, [fluids.length]);
+
   useEffect(() => {
     const el = gl.domElement;
     const s = input.current;
+    /** Which view's camera settings the pointer is editing. */
+    const activeView = () => (conductor.headingToSolar ? 1 : 0);
 
     const setNdc = (e: PointerEvent) => {
       const r = el.getBoundingClientRect();
@@ -318,7 +452,7 @@ function Interaction({ fluids, dimming }: { fluids: FluidEntry[]; dimming: numbe
     const down = (e: PointerEvent) => {
       // right click: everything stuck (in every fluid) turns back into fluid
       if (e.button === 2) {
-        for (const f of fluidsRef.current) f.sim.unpinAll();
+        for (const f of live.current.fluids) f.sim.unpinAll();
         s.grabbing = false;
         s.grabSim = null;
         return;
@@ -327,12 +461,13 @@ function Interaction({ fluids, dimming }: { fluids: FluidEntry[]; dimming: numbe
       setNdc(e);
       el.setPointerCapture(e.pointerId);
 
-      // left click on a fluid grabs a globule of it (hold Shift to orbit instead)
-      if (!e.shiftKey) {
+      // left click on a fluid grabs a globule of it (hold Shift to orbit instead).
+      // Only in the tank: in the solar view a grabbed blob would fight its orbit.
+      if (!e.shiftKey && conductor.p < 0.02) {
         tmp.ray.setFromCamera(s.ndc, camera);
         const o = tmp.ray.ray.origin;
         const d = tmp.ray.ray.direction;
-        const target = pickFluid(fluidsRef.current, o, d, grabRayRadius);
+        const target = pickFluid(live.current.fluids, o, d, grabRayRadius);
         const center = target?.sim.grab(
           [o.x, o.y, o.z],
           [d.x, d.y, d.z],
@@ -358,9 +493,10 @@ function Interaction({ fluids, dimming }: { fluids: FluidEntry[]; dimming: numbe
       setNdc(e);
       s.inside = true;
       if (s.dragging) {
+        const v = activeView();
         s.theta -= (e.clientX - s.lastX) * 0.007;
-        s.phi = THREE.MathUtils.clamp(
-          s.phi - (e.clientY - s.lastY) * 0.007,
+        s.phi[v] = THREE.MathUtils.clamp(
+          s.phi[v] - (e.clientY - s.lastY) * 0.007,
           0.15,
           Math.PI / 2 - 0.02,
         );
@@ -389,7 +525,9 @@ function Interaction({ fluids, dimming }: { fluids: FluidEntry[]; dimming: numbe
     const noMenu = (e: Event) => e.preventDefault();
     const wheel = (e: WheelEvent) => {
       e.preventDefault();
-      s.dist = THREE.MathUtils.clamp(s.dist * Math.exp(e.deltaY * 0.001), 1.8, 7);
+      const v = activeView();
+      const [lo, hi] = v === 0 ? [1.8, 7] : [3, 45];
+      s.dist[v] = THREE.MathUtils.clamp(s.dist[v] * Math.exp(e.deltaY * 0.001), lo, hi);
     };
 
     el.addEventListener("pointerdown", down);
@@ -408,21 +546,26 @@ function Interaction({ fluids, dimming }: { fluids: FluidEntry[]; dimming: numbe
       el.removeEventListener("wheel", wheel);
       el.removeEventListener("contextmenu", noMenu);
     };
-  }, [gl, camera, tmp]);
+  }, [gl, camera, tmp, conductor]);
 
   useFrame(() => {
     const s = input.current;
+    const e = easeInOutCubic(conductor.p);
 
-    // ---- camera orbit ----
-    const sp = Math.sin(s.phi);
+    // ---- camera: eases from framing the tank to framing the whole system ----
+    const dist = s.dist[0] + (s.dist[1] - s.dist[0]) * e;
+    const phi = s.phi[0] + (s.phi[1] - s.phi[0]) * e;
+    tmp.target.copy(TANK_CENTER).lerp(SUN_CENTER, e);
+    const sp = Math.sin(phi);
     camera.position.set(
-      TANK_CENTER.x + s.dist * sp * Math.sin(s.theta),
-      TANK_CENTER.y + s.dist * Math.cos(s.phi),
-      TANK_CENTER.z + s.dist * sp * Math.cos(s.theta),
+      tmp.target.x + dist * sp * Math.sin(s.theta),
+      tmp.target.y + dist * Math.cos(phi),
+      tmp.target.z + dist * sp * Math.cos(s.theta),
     );
-    camera.lookAt(TANK_CENTER);
+    camera.lookAt(tmp.target);
     camera.updateMatrixWorld();
-    updateFog(scene, s.dist, dimRef.current);
+    // the solar system is far deeper than the tank, so the fade has to spread out
+    updateFog(scene, dist, live.current.dimming, 2 + e * dist * 0.9);
 
     // ---- dragging a grabbed globule ----
     let hit: [number, number, number] | null = null;
@@ -448,12 +591,12 @@ function Interaction({ fluids, dimming }: { fluids: FluidEntry[]; dimming: numbe
       const speed = s.delta.length();
       tmp.right.setFromMatrixColumn(camera.matrixWorld, 0);
       tmp.up.setFromMatrixColumn(camera.matrixWorld, 1);
-      const G = 5 * s.dist;
+      const G = 5 * dist;
       const push = Math.min(speed * G * 0.5, 1);
       const ix = tmp.right.x * s.delta.x * G + tmp.up.x * s.delta.y * G + d.x * push;
       const iy = tmp.right.y * s.delta.x * G + tmp.up.y * s.delta.y * G + d.y * push;
       const iz = tmp.right.z * s.delta.x * G + tmp.up.z * s.delta.y * G + d.z * push;
-      const target = pickFluid(fluidsRef.current, o, d, splashRadius);
+      const target = pickFluid(live.current.fluids, o, d, splashRadius);
       if (target) {
         hit = target.sim.splash(
           [o.x, o.y, o.z],
@@ -483,16 +626,90 @@ function Interaction({ fluids, dimming }: { fluids: FluidEntry[]; dimming: numbe
 }
 
 // ---------------------------------------------------------------------------
+// chrome
+// ---------------------------------------------------------------------------
+
+function ViewTabs({ view, onChange }: { view: View; onChange: (v: View) => void }) {
+  const tabs: { id: View; label: string }[] = [
+    { id: "tank", label: "Tank" },
+    { id: "solar", label: "Solar system" },
+  ];
+  return (
+    <div
+      role="tablist"
+      aria-label="View"
+      className="absolute left-1/2 top-5 flex -translate-x-1/2 select-none gap-1 rounded-full border border-white/15 bg-[#0b1226]/80 p-1 backdrop-blur"
+    >
+      {tabs.map((t) => (
+        <button
+          key={t.id}
+          role="tab"
+          aria-selected={view === t.id}
+          onClick={() => onChange(t.id)}
+          className={
+            "rounded-full px-4 py-1.5 text-sm transition duration-300 " +
+            (view === t.id
+              ? "bg-white/90 text-[#0b1226] shadow"
+              : "text-white/60 hover:bg-white/10 hover:text-white")
+          }
+        >
+          {t.label}
+        </button>
+      ))}
+    </div>
+  );
+}
+
+/** Which planet is which, and how big it is. The groundwork for showing amounts. */
+function SolarLegend({ fluids }: { fluids: FluidEntry[] }) {
+  const total = fluids.reduce((a, f) => a + f.sim.count, 0) || 1;
+  return (
+    <div className="absolute right-5 top-5 w-64 select-none rounded-2xl border border-white/15 bg-[#0b1226]/80 p-4 text-white shadow-xl backdrop-blur">
+      <h2 className="text-sm font-semibold tracking-tight">Planets</h2>
+      <p className="mt-0.5 text-xs text-white/50">
+        Each fluid becomes a world. Its size is the volume you gave it in the tank.
+      </p>
+      <ul className="mt-3 space-y-1.5">
+        {fluids.map((f, i) => (
+          <li key={f.id} className="flex items-center gap-2 text-xs">
+            <span
+              className="h-3 w-3 shrink-0 rounded-full"
+              style={{ background: f.color, boxShadow: `0 0 10px ${f.color}` }}
+            />
+            <span className="w-14 shrink-0 text-white/80">Orbit {i + 1}</span>
+            <span className="h-1.5 flex-1 overflow-hidden rounded-full bg-white/10">
+              <span
+                className="block h-full rounded-full transition-[width] duration-700"
+                style={{ width: `${(f.sim.count / total) * 100}%`, background: f.color }}
+              />
+            </span>
+            <span className="w-10 shrink-0 text-right tabular-nums text-white/45">
+              {Math.round((f.sim.count / total) * 100)}%
+            </span>
+          </li>
+        ))}
+      </ul>
+      <p className="mt-3 text-[10px] leading-snug text-white/35">
+        Switch back to the tank to add worlds or change how much each one holds.
+      </p>
+    </div>
+  );
+}
+
+// ---------------------------------------------------------------------------
 
 export default function FluidScene() {
   const nextId = useRef(1);
   const [fluids, setFluids] = useState<FluidEntry[]>(() => [createFluid(0, 0, FLUID_COLORS[0])]);
   const [dimming, setDimming] = useState(DEFAULT_DIMMING);
   const [overlapDimming, setOverlapDimming] = useState(DEFAULT_OVERLAP_DIMMING);
+  const [view, setView] = useState<View>("tank");
   const overlap = useMemo(() => new OverlapField(), []);
+  const conductor = useMemo(() => new ViewTransition(), []);
+  const inTank = view === "tank";
   useEffect(() => {
-    overlap.setAmount(overlapDimming);
-  }, [overlap, overlapDimming]);
+    conductor.setTarget(view === "solar" ? 1 : 0);
+  }, [conductor, view]);
 
   const addFluid = () => {
     if (fluids.length >= MAX_FLUIDS) return;
@@ -502,7 +719,8 @@ export default function FluidScene() {
     const entry = createFluid(nextId.current++, fluids.length, color);
     setFluids((prev) => [...prev, entry]);
   };
-  const removeFluid = (id: number) => setFluids((prev) => (prev.length > 1 ? prev.filter((f) => f.id !== id) : prev));
+  const removeFluid = (id: number) =>
+    setFluids((prev) => (prev.length > 1 ? prev.filter((f) => f.id !== id) : prev));
   const setColor = (id: number, color: string) =>
     setFluids((prev) => prev.map((f) => (f.id === id ? { ...f, color } : f)));
   const applySurface = (id: number, expr: string, fn: SurfaceFn) => {
@@ -513,7 +731,7 @@ export default function FluidScene() {
   return (
     <div className="relative h-screen w-screen overflow-hidden bg-[#070b17]">
       <Canvas
-        camera={{ fov: 45, near: 0.1, far: 50, position: [2, 2, 3] }}
+        camera={{ fov: 45, near: 0.1, far: 250, position: [2, 2, 3] }}
         dpr={[1, 2]}
         style={{ touchAction: "none", cursor: "crosshair" }}
       >
@@ -522,21 +740,34 @@ export default function FluidScene() {
         <ambientLight intensity={0.7} />
         <directionalLight position={[3, 5, 2]} intensity={2.2} />
         <directionalLight position={[-3, 2, -2]} intensity={0.6} color="#7aa7ff" />
-        <Tank />
+        <SimDriver
+          fluids={fluids}
+          conductor={conductor}
+          overlap={overlap}
+          overlapDimming={overlapDimming}
+        />
+        <Tank conductor={conductor} />
+        <SolarSystem conductor={conductor} count={fluids.length} />
         <OverlapUpdater fluids={fluids} overlap={overlap} />
         {fluids.map((f) => (
           <FluidLayer key={f.id} fluid={f} overlap={overlap} />
         ))}
-        <Interaction fluids={fluids} dimming={dimming} />
+        <Interaction fluids={fluids} dimming={dimming} conductor={conductor} />
       </Canvas>
 
-      <div className="pointer-events-none absolute left-5 top-5 max-w-md select-none text-white/80">
-        <h1 className="text-lg font-semibold tracking-tight">3D Fluid</h1>
-        <p className="mt-1 text-sm text-white/50">
-          Move to splash · drag a fluid to grab a blob · right-click to melt it back · drag empty space (or
-          hold Shift) to rotate · scroll to zoom
+      <ViewTabs view={view} onChange={setView} />
+
+      <div className="pointer-events-none absolute left-5 top-5 max-w-sm select-none text-white/80">
+        <h1 className="text-lg font-semibold tracking-tight">
+          {inTank ? "3D Fluid" : "Your system"}
+        </h1>
+        <p className="mt-1 text-sm text-white/50 transition-opacity duration-500">
+          {inTank
+            ? "Move to splash · drag a fluid to grab a blob · right-click to melt it back · drag empty space (or hold Shift) to rotate · scroll to zoom"
+            : "Every fluid has balled up into a world of the same dots. Drag to rotate · scroll to zoom · move the cursor to disturb a planet."}
         </p>
       </div>
+
       <div className="absolute bottom-5 left-5 flex select-none flex-col gap-2">
         {(
           [
@@ -562,20 +793,38 @@ export default function FluidScene() {
           </label>
         ))}
       </div>
-      <SurfacePanel
-        fluids={fluids}
-        maxFluids={MAX_FLUIDS}
-        onAdd={addFluid}
-        onRemove={removeFluid}
-        onColor={setColor}
-        onApply={applySurface}
-      />
-      <button
-        onClick={() => fluids.forEach((f) => f.sim.reset())}
-        className="absolute bottom-5 right-5 rounded-full border border-white/20 bg-white/10 px-4 py-2 text-sm text-white backdrop-blur transition hover:bg-white/20"
+
+      {/* the panels cross-fade with the view (opacity only: a transform here would
+          re-anchor the absolutely-positioned panels inside) */}
+      <div
+        className={
+          "transition-opacity duration-500 " +
+          (inTank ? "opacity-100" : "pointer-events-none opacity-0")
+        }
       >
-        Drop new water
-      </button>
+        <SurfacePanel
+          fluids={fluids}
+          maxFluids={MAX_FLUIDS}
+          onAdd={addFluid}
+          onRemove={removeFluid}
+          onColor={setColor}
+          onApply={applySurface}
+        />
+        <button
+          onClick={() => fluids.forEach((f) => f.sim.reset())}
+          className="absolute bottom-5 right-5 rounded-full border border-white/20 bg-white/10 px-4 py-2 text-sm text-white backdrop-blur transition hover:bg-white/20"
+        >
+          Drop new water
+        </button>
+      </div>
+      <div
+        className={
+          "transition-opacity duration-500 " +
+          (inTank ? "pointer-events-none opacity-0" : "opacity-100")
+        }
+      >
+        <SolarLegend fluids={fluids} />
+      </div>
     </div>
   );
 }
