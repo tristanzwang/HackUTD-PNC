@@ -39,8 +39,10 @@ import { formatUSD } from "@/lib/finance/scene-bridge";
 import { Scrub } from "@/lib/finance/scrub";
 import { gridToWorldSurface } from "@/lib/units";
 import CategoryPanel from "./CategoryPanel";
+import ChatPanel, { ChatButton } from "./ChatPanel";
 import { AgentStatus, Scrubber } from "./FinanceUI";
 import SurfacePanel from "./SurfacePanel";
+import { useCompanion } from "./useCompanion";
 import { useProjection } from "./useProjection";
 import { CHIP, FOCUS, GLASS, PRESS, collapsible } from "./ui";
 
@@ -320,7 +322,10 @@ function SimDriver({
       // finance planet is sized so its volume matches what its category is worth at
       // the scrubbed month (radius = packing x its natural radius).
       const orbitPacking = f.data
-        ? Math.min(Math.max(f.data.radiusAt(scrub.k) / sim.tankBallRadius, 0.2), 1.4)
+        ? Math.min(
+            Math.max(f.data.radiusAt(scrub.k) / sim.tankBallRadius, 0.2),
+            1.4,
+          )
         : ORBIT_PACKING;
       sim.setPacking(1 - (1 - orbitPacking) * gather);
       if (c.p === 0) return;
@@ -872,8 +877,8 @@ function ViewTabs({
   onChange: (v: View) => void;
 }) {
   const tabs: { id: View; label: string }[] = [
-    { id: "graph", label: "Graph" },
-    { id: "solar", label: "Solar system" },
+    { id: "graph", label: "Sandbox" },
+    { id: "solar", label: "Galaxy" },
   ];
   const refs = useRef<Record<string, HTMLButtonElement | null>>({});
   // arrow keys move between tabs, as in any native segmented control
@@ -1111,7 +1116,13 @@ function FluidDock({
             inert={!canOpen}
             aria-label={name}
             aria-pressed={on}
-            title={f.data ? `${name} · ${formatUSD(f.data.amountAt(0))}` : inGraph ? `${name}: edit` : name}
+            title={
+              f.data
+                ? `${name} · ${formatUSD(f.data.amountAt(0))}`
+                : inGraph
+                  ? `${name}: edit`
+                  : name
+            }
             className={
               "flex items-center justify-center rounded-full p-0.5 " +
               PRESS +
@@ -1130,9 +1141,7 @@ function FluidDock({
         className={
           "grid transition-[grid-template-columns,opacity] duration-500 " +
           "ease-[cubic-bezier(0.32,0.72,0,1)] motion-reduce:duration-150 " +
-          (canAdd
-            ? "grid-cols-[1fr] opacity-100"
-            : "grid-cols-[0fr] opacity-0")
+          (canAdd ? "grid-cols-[1fr] opacity-100" : "grid-cols-[0fr] opacity-0")
         }
       >
         <div className="min-w-0 overflow-hidden">
@@ -1182,36 +1191,73 @@ export default function FluidScene() {
   const inGraph = view === "graph";
 
   // ---- the user's finances: read, forecast, and turned into graphs and planets ----
-  const projection = useProjection();
+  const companion = useCompanion();
+  // what the user has told Pluto (their plans) is part of the forecast
+  const projection = useProjection(companion.profile.adjustments);
   const scene = useMemo(
     () => (projection.data ? buildFinanceScene(projection.data) : null),
     [projection.data],
   );
   const scrub = useMemo(() => new Scrub(), []);
   const fluidsRef = useRef(fluids);
-  const syncedVersion = useRef<string | null>(null);
+  const dataVersion = useRef<string | null>(null); // the forecast the fluids' numbers come from
+  const surfaceVersion = useRef<string | null>(null); // the forecast their pools were filled from
   useEffect(() => {
     fluidsRef.current = fluids;
   }, [fluids]);
-  // When a new forecast arrives, turn it into graphs. Updating a graph refills its
-  // pool, which would yank a planet off its orbit, so a change that lands while the
-  // solar view is up waits until the user is back in the graph view.
+  // When a new forecast arrives, turn it into graphs and planets.
+  //  - A new set of categories (the first load) builds the fluids. That refills pools,
+  //    so it waits for the graph view.
+  //  - The same categories with new numbers (the user told Pluto about a plan) swap
+  //    the numbers at once, so planets resize even from the solar view, but only
+  //    refill the graph pools once the user is back in the graph view: refilling a
+  //    pool would yank a planet off its orbit.
   useEffect(() => {
-    if (!scene || !inGraph || syncedVersion.current === scene.version) return;
-    syncedVersion.current = scene.version;
-    const prev = fluidsRef.current;
-    const same =
-      prev.length === scene.graphs.length &&
-      prev.every((f, i) => f.data?.key === scene.graphs[i].key);
-    const next = scene.graphs.map((g, i) => {
-      const entry = same
-        ? prev[i]
-        : createFluid(1000 + g.orbit, g.slot, FLUID_COLORS[g.orbit % FLUID_COLORS.length]);
-      entry.sim.setSurface(gridToWorldSurface(g.surface));
-      return { ...entry, expr: g.label, data: g };
+    if (!scene) return;
+    // applied in a callback, as a response to data arriving from outside; the version
+    // refs make a repeat run (React strict mode, a view change) a no-op
+    queueMicrotask(() => {
+      const prev = fluidsRef.current;
+      const same =
+        prev.length === scene.graphs.length &&
+        prev.every((f, i) => f.data?.key === scene.graphs[i].key);
+
+      if (!same) {
+        // (the ref can lag a render behind, so a repeat run must not rebuild what was just built)
+        if (!inGraph || dataVersion.current === scene.version) return;
+        const next = scene.graphs.map((g) => {
+          const entry = createFluid(
+            1000 + g.orbit,
+            g.slot,
+            FLUID_COLORS[g.orbit % FLUID_COLORS.length],
+          );
+          entry.sim.setSurface(gridToWorldSurface(g.surface));
+          return { ...entry, expr: g.label, data: g };
+        });
+        dataVersion.current = surfaceVersion.current = scene.version;
+        setFluids(next);
+        setSelectedId((id) =>
+          next.some((f) => f.id === id) ? id : next[0].id,
+        );
+        return;
+      }
+      if (dataVersion.current !== scene.version) {
+        dataVersion.current = scene.version;
+        setFluids(
+          prev.map((f, i) => ({
+            ...f,
+            expr: scene.graphs[i].label,
+            data: scene.graphs[i],
+          })),
+        );
+      }
+      if (inGraph && surfaceVersion.current !== scene.version) {
+        surfaceVersion.current = scene.version;
+        prev.forEach((f, i) =>
+          f.sim.setSurface(gridToWorldSurface(scene.graphs[i].surface)),
+        );
+      }
     });
-    setFluids(next);
-    setSelectedId((id) => (next.some((f) => f.id === id) ? id : next[0].id));
   }, [scene, inGraph]);
   useEffect(() => {
     conductor.setTarget(view === "solar" ? 1 : 0);
@@ -1257,6 +1303,13 @@ export default function FluidScene() {
   // in the graph view the open category stands out and the rest recede
   const focusId = panelOpen && inGraph && selected.data ? selected.id : null;
   const closePanel = () => setPanelOpen(false);
+  // Pluto: the overseer briefs it each time the window opens
+  const [chatOpen, setChatOpen] = useState(false);
+  const toggleChat = () => {
+    const next = !chatOpen;
+    setChatOpen(next);
+    if (next) companion.open();
+  };
   const setColor = (id: number, color: string) =>
     setFluids((prev) => prev.map((f) => (f.id === id ? { ...f, color } : f)));
   const applySurface = (id: number, expr: string, fn: SurfaceFn) => {
@@ -1359,7 +1412,19 @@ export default function FluidScene() {
       )}
 
       {scene && <Scrubber scrub={scrub} scene={scene} show={!inGraph} />}
-      <AgentStatus state={projection} />
+      <div className="absolute bottom-5 left-5 flex items-center gap-2">
+        <ChatButton
+          open={chatOpen}
+          invite={companion.messages.length === 0}
+          onClick={toggleChat}
+        />
+        <AgentStatus state={projection} />
+      </div>
+      <ChatPanel
+        open={chatOpen}
+        companion={companion}
+        onClose={() => setChatOpen(false)}
+      />
     </div>
   );
 }

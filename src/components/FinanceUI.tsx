@@ -159,7 +159,7 @@ export function AgentStatus({ state }: { state: ProjectionState }) {
       title={title}
       role="status"
       className={
-        "rise absolute bottom-5 left-5 flex select-none items-center gap-2 rounded-full px-3.5 py-2 " +
+        "rise flex select-none items-center gap-2 rounded-full px-3.5 py-2 " +
         "text-[0.98rem] text-white/80 " +
         GLASS
       }

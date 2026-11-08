@@ -139,7 +139,7 @@ export default function CategoryPanel({
         </div>
         <p
           title={m.rationale}
-          className="mt-1.5 line-clamp-4 text-[0.98rem] italic leading-snug text-white/65"
+          className="mt-1.5 line-clamp-4 text-[0.98rem] leading-snug text-white/65"
         >
           {m.rationale}
         </p>
@@ -158,6 +158,18 @@ export default function CategoryPanel({
       <Divider className="relative my-3.5" />
 
       <p className="relative text-[1.02rem] leading-snug text-white/85">{cat.insight}</p>
+      {cat.plans.length > 0 && (
+        <div className="relative mt-3 rounded-2xl border border-white/15 bg-white/[0.05] px-3 py-2">
+          <p className="text-xs uppercase tracking-[0.12em] text-white/45">From our chat</p>
+          <ul className="mt-1 space-y-0.5 text-[0.98rem] leading-snug text-white/80">
+            {cat.plans.map((p, i) => (
+              <li key={i} title={p.evidence ? `You said: “${p.evidence}”` : undefined}>
+                · {p.note}
+              </li>
+            ))}
+          </ul>
+        </div>
+      )}
       <p className="relative mt-3 text-[0.8rem] leading-snug text-white/35">
         An estimate from past patterns, not a guarantee. Real life changes.
       </p>

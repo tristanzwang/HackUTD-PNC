@@ -9,6 +9,7 @@
  */
 
 import { chooseModel } from "../agents/estimator";
+import type { ForecastAdjustment } from "../chat/types";
 import { buildProjection, heuristicChoice, type Choice, type Projection } from "./projection";
 import { makePersona, type CategoryKey, type Persona } from "./synth";
 
@@ -122,29 +123,70 @@ async function chooseAll(persona: Persona) {
 // cached entry point
 // ---------------------------------------------------------------------------
 
-type Cached = { version: string; result: Projection };
-let cache: Cached | null = null;
-let inflight: Promise<Projection> | null = null;
-export async function getProjection(opts: { force?: boolean } = {}): Promise<Projection> {
-  const persona = await loadHistory();
-  const version = versionOf(persona);
-  // Same history, same answer: never re-spend model tokens on data we have already read.
-  if (cache && cache.version === version && !opts.force) return cache.result;
-  if (inflight) return inflight; // several polls at once share one set of model calls
+type Chosen = { version: string; choices: Partial<Record<CategoryKey, Choice>>; note?: string };
+let chosen: Chosen | null = null;
+let inflight: Promise<Chosen> | null = null;
+/** Finished projections by history + plans, so the same question is never answered twice. */
+const results = new Map<string, Projection>();
 
+/** The model's forecaster picks. Expensive, so cached against the history alone. */
+async function getChoices(persona: Persona, version: string, force: boolean): Promise<Chosen> {
+  if (chosen && chosen.version === version && !force) return chosen;
+  if (inflight) return inflight; // several callers at once share one set of model calls
   inflight = (async () => {
     try {
       const { choices, note } = await chooseAll(persona);
-      const result = buildProjection(persona, HORIZON, choices, {
-        version,
-        generatedAt: new Date().toISOString(),
-        note,
-      });
-      cache = { version, result };
-      return result;
+      chosen = { version, choices, note };
+      return chosen;
     } finally {
       inflight = null;
     }
   })();
   return inflight;
+}
+
+/** A short hash of a set of plans, so a changed plan list is a changed version. */
+function plansKey(plans: ForecastAdjustment[]): string {
+  if (!plans.length) return "";
+  const s = plans.map((p) => [p.id, p.category, p.kind, p.startOffset, p.everyMonths, p.amount, p.direction, p.mode].join(",")).join("|");
+  let h = 2166136261;
+  for (let i = 0; i < s.length; i++) {
+    h ^= s.charCodeAt(i);
+    h = Math.imul(h, 16777619);
+  }
+  return (h >>> 0).toString(36);
+}
+
+/**
+ * The projection for the current history and the user's plans. The model's picks are
+ * cached against the history, so changing a plan re-runs only the (instant, local)
+ * forecast math and never spends model tokens.
+ */
+export async function getProjection(
+  opts: { force?: boolean; adjustments?: ForecastAdjustment[] } = {},
+): Promise<Projection> {
+  const persona = await loadHistory();
+  const version = versionOf(persona);
+  const plans = opts.adjustments ?? [];
+  const pk = plansKey(plans);
+  const key = `${version}:${pk}`;
+
+  if (opts.force) {
+    chosen = null;
+    results.clear();
+  }
+  const hit = results.get(key);
+  if (hit) return hit;
+
+  const { choices, note } = await getChoices(persona, version, !!opts.force);
+  const result = buildProjection(
+    persona,
+    HORIZON,
+    choices,
+    { version: pk ? `${version}+${pk}` : version, generatedAt: new Date().toISOString(), note },
+    plans,
+  );
+  if (results.size >= 12) results.delete(results.keys().next().value as string);
+  results.set(key, result);
+  return result;
 }

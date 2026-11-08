@@ -10,7 +10,9 @@
  *     so a hallucinated number can never reach the user.
  */
 
+import type { ForecastAdjustment } from "../chat/types";
 import type { CallRecord } from "../nemotron/client";
+import { combineDeltas, isFlow } from "./adjust";
 import { evidence, fit, project, type FitSpec } from "./forecast";
 import type { CategoryKey, CategorySpec, Persona } from "./synth";
 
@@ -39,6 +41,8 @@ export type CategoryProjection = {
   model: ModelInfo;
   /** Plain-language reading of where this is heading, built from the numbers. */
   insight: string;
+  /** Plans from the chat that are included in this forecast (what the user told us). */
+  plans: { note: string; evidence: string }[];
 };
 
 export type Summary = {
@@ -61,6 +65,8 @@ export type Projection = {
   horizon: number;
   categories: CategoryProjection[];
   summary: Summary;
+  /** The user's plans that were applied. */
+  adjustments: ForecastAdjustment[];
   agent: {
     /** True when Nemotron picked at least one model; false = every pick was the local heuristic. */
     live: boolean;
@@ -188,20 +194,40 @@ export function buildProjection(
   horizon: number,
   choices: Partial<Record<CategoryKey, Choice>>,
   meta: { version: string; generatedAt: string; note?: string },
+  adjustments: ForecastAdjustment[] = [],
 ): Projection {
   const incomeNow = persona.series.income?.[persona.series.income.length - 1] ?? 0;
 
-  const categories: CategoryProjection[] = persona.categories.map((spec) => {
+  // 1. the baseline: each category's fitted forecast, before any of the user's plans
+  const base = persona.categories.map((spec) => {
     const y = persona.series[spec.key];
     const choice = choices[spec.key] ?? heuristicChoice(y, spec.kind);
     const f = fit(y, choice.spec);
-    const forecast = project(f, horizon).map(({ value, lo, hi }) => ({
-      value: Math.max(0, value),
-      lo,
-      hi,
-    }));
+    return { spec, y, choice, forecast: project(f, horizon) };
+  });
+
+  // 2. what the user told us changes, deterministically (see adjust.ts)
+  const baselines: Partial<Record<CategoryKey, number[]>> = {};
+  for (const b of base) baselines[b.spec.key] = b.forecast.map((p) => Math.max(0, p.value));
+  const deltas = combineDeltas(adjustments, baselines, horizon);
+  const hasFlowPlan = adjustments.some((a) => isFlow(a.category));
+
+  const categories: CategoryProjection[] = base.map(({ spec, y, choice, forecast: raw }) => {
+    const d = deltas[spec.key];
+    const forecast = raw.map(({ value, lo, hi }, i) => {
+      const x = d ? d[i] : 0;
+      return { value: Math.max(0, value + x), lo: Math.max(0, lo + x), hi: Math.max(0, hi + x) };
+    });
+    const plans = adjustments
+      .filter((a) => a.category === spec.key)
+      .map((a) => ({ note: a.note, evidence: a.evidence }));
+    if (spec.key === "checking" && hasFlowPlan)
+      plans.push({ note: "Carries the net effect of your income and spending plans", evidence: "" });
+
     const now = y[y.length - 1];
     const last = forecast[forecast.length - 1];
+    let insight = insightFor(spec, now, last.value, last.lo, last.hi, horizon, incomeNow);
+    if (plans.length) insight += ` This includes what you told me: ${plans.map((p) => p.note.replace(/\.$/, "")).join("; ")}.`;
     return {
       key: spec.key,
       label: spec.label,
@@ -216,7 +242,8 @@ export function buildProjection(
         source: choice.source,
         call: choice.call,
       },
-      insight: insightFor(spec, now, last.value, last.lo, last.hi, horizon, incomeNow),
+      insight,
+      plans,
     };
   });
 
@@ -245,6 +272,7 @@ export function buildProjection(
     horizon,
     categories,
     summary,
+    adjustments,
     agent: { live, note: meta.note },
   };
 }
