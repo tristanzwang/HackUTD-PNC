@@ -139,6 +139,13 @@ function parse(tokens: Token[]): Node {
       const f = FUNCS2[name], [a, b] = args;
       return (x, z) => f(a(x, z), b(x, z));
     }
+    if (name in FUNCS1) {
+      // calculator style: "sin x", "sin x^2", "sin -x" (argument binds like a unary term)
+      if (startsPrimary() || isOp("-") || isOp("+")) {
+        const f = FUNCS1[name], a = unary();
+        return (x, z) => f(a(x, z));
+      }
+    }
     if (name === "x") return (x) => x;
     if (name === "z") return (_x, z) => z;
     if (name in CONSTS) {
@@ -162,9 +169,21 @@ function parse(tokens: Token[]): Node {
   return root;
 }
 
+/** Accept the symbols people paste or type: π, ², ×, ÷, ·, unicode minus, trailing ";". */
+function normalize(src: string) {
+  return src
+    .replace(/π/g, " pi ")
+    .replace(/[×·∗]/g, "*")
+    .replace(/÷/g, "/")
+    .replace(/[−–]/g, "-")
+    .replace(/²/g, "^2")
+    .replace(/³/g, "^3")
+    .replace(/[;\s]+$/, "");
+}
+
 /** Compile "0.2*sin(5x)*cos(5z)" (optionally written "y = ..." / "h(x,z) = ...") into a function. */
 export function compileSurface(source: string): CompileResult {
-  let src = source.trim();
+  let src = normalize(source.trim());
   if (src.includes("=")) src = src.slice(src.lastIndexOf("=") + 1);
   if (!src.trim()) return { ok: false, error: "enter an expression in x and z" };
   try {

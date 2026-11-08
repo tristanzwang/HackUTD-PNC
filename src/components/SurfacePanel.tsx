@@ -2,23 +2,25 @@
 
 import { useEffect, useMemo, useRef, useState } from "react";
 import { compileSurface, type SurfaceFn } from "@/lib/expression";
-import { MAX_SURFACE_HEIGHT, TANK } from "@/lib/fluid-sim";
-import { AXIS_MAX, MAX_SURFACE_UNITS, gridToWorldSurface } from "@/lib/units";
+import type { FluidEntry } from "@/lib/fluid-config";
+import { analyzeSurface as analyze, adviceFor } from "@/lib/surface-analysis";
+import { AXIS_MAX, gridToWorldSurface } from "@/lib/units";
 
-// x and z run 0..100 across the floor of the grid; the result is height in y-axis units
+// x and z run 0..100 across the floor of the grid; the result is the surface's height on the y axis (0..100)
 const PRESETS: { name: string; expr: string }[] = [
-  { name: "Flat", expr: "0" },
-  { name: "Hill", expr: "25*exp(-((x-50)^2+(z-50)^2)/800)" },
-  { name: "Bowl", expr: "0.0073*((x-50)^2+(z-50)^2)" },
-  { name: "Ramp", expr: "0.35*(x-50)" },
-  { name: "Waves", expr: "7*sin(0.08*x)" },
-  { name: "Ripples", expr: "6*sin(0.13*sqrt((x-50)^2+(z-50)^2))" },
-  { name: "Saddle", expr: "0.009*((x-50)^2-(z-50)^2)" },
-  { name: "Egg carton", expr: "5*sin(0.1*x)*sin(0.1*z)" },
+  { name: "Flat", expr: "40" },
+  { name: "Shallow", expr: "15" },
+  { name: "Deep", expr: "70" },
+  { name: "Hill", expr: "25+30*exp(-((x-50)^2+(z-50)^2)/800)" },
+  { name: "Bowl", expr: "15+0.007*((x-50)^2+(z-50)^2)" },
+  { name: "Ramp", expr: "40+0.35*(x-50)" },
+  { name: "Waves", expr: "40+7*sin(0.08*x)" },
+  { name: "Ripples", expr: "40+6*sin(0.13*sqrt((x-50)^2+(z-50)^2))" },
+  { name: "Saddle", expr: "40+0.009*((x-50)^2-(z-50)^2)" },
+  { name: "Egg carton", expr: "40+5*sin(0.1*x)*sin(0.1*z)" },
 ];
-const CLIP_LABEL = String(Math.round(MAX_SURFACE_UNITS));
 
-// diverging ramp: low = deep blue, 0 = near white, high = amber (matches the colour bar)
+// height ramp: 0 = deep blue, 50 = near white, 100 = amber (matches the colour bar)
 const LOW = [23, 48, 107];
 const MID = [232, 246, 255];
 const HIGH = [255, 179, 71];
@@ -30,16 +32,14 @@ function drawPreview(canvas: HTMLCanvasElement, fn: SurfaceFn) {
   const g = canvas.getContext("2d");
   if (!g) return;
   const img = g.createImageData(RES, RES);
-  const w = TANK.maxX - TANK.minX;
-  const d = TANK.maxZ - TANK.minZ;
   for (let k = 0; k < RES; k++) {
     for (let i = 0; i < RES; i++) {
-      const x = TANK.minX + ((i + 0.5) / RES) * w;
-      const z = TANK.maxZ - ((k + 0.5) / RES) * d; // z increases upward
+      const x = ((i + 0.5) / RES) * AXIS_MAX;
+      const z = AXIS_MAX - ((k + 0.5) / RES) * AXIS_MAX; // z increases upward
       let v = fn(x, z);
       if (!Number.isFinite(v)) v = 0;
-      const t = Math.max(-1, Math.min(1, v / MAX_SURFACE_HEIGHT));
-      const c = t < 0 ? lerp(MID, LOW, -t) : lerp(MID, HIGH, t);
+      const t = Math.max(0, Math.min(1, v / AXIS_MAX));
+      const c = t < 0.5 ? lerp(LOW, MID, t * 2) : lerp(MID, HIGH, (t - 0.5) * 2);
       const o = (k * RES + i) * 4;
       img.data[o] = c[0];
       img.data[o + 1] = c[1];
@@ -50,17 +50,26 @@ function drawPreview(canvas: HTMLCanvasElement, fn: SurfaceFn) {
   g.putImageData(img, 0, 0);
 }
 
-export default function SurfacePanel({ onApply }: { onApply: (fn: SurfaceFn | null) => void }) {
-  const [text, setText] = useState("0");
-  const [applied, setApplied] = useState("0");
+/** Expression box, presets and live preview for one fluid's surface graph. */
+function SurfaceEditor({
+  initialExpr,
+  onApply,
+}: {
+  initialExpr: string;
+  onApply: (expr: string, fn: SurfaceFn) => void;
+}) {
+  const [text, setText] = useState(initialExpr);
+  const [applied, setApplied] = useState(initialExpr);
   const canvas = useRef<HTMLCanvasElement>(null);
 
   const compiled = useMemo(() => compileSurface(text), [text]);
+  const stats = useMemo(() => (compiled.ok ? analyze(compiled.fn) : null), [compiled]);
+  const advice = stats ? adviceFor(stats) : null;
 
   // live preview of whatever is typed (once it's valid)
   const lastGood = useRef<SurfaceFn>(() => 0);
   useEffect(() => {
-    if (compiled.ok) lastGood.current = gridToWorldSurface(compiled.fn);
+    if (compiled.ok) lastGood.current = compiled.fn;
     if (canvas.current) drawPreview(canvas.current, lastGood.current);
   }, [compiled]);
 
@@ -68,7 +77,7 @@ export default function SurfacePanel({ onApply }: { onApply: (fn: SurfaceFn | nu
     const r = compileSurface(expr);
     if (!r.ok) return;
     setApplied(expr);
-    onApply(gridToWorldSurface(r.fn));
+    onApply(expr, gridToWorldSurface(r.fn));
   };
 
   const selectPreset = (expr: string) => {
@@ -77,19 +86,19 @@ export default function SurfacePanel({ onApply }: { onApply: (fn: SurfaceFn | nu
   };
 
   return (
-    <div className="absolute right-5 top-5 w-72 select-none rounded-2xl border border-white/15 bg-[#0b1226]/80 p-4 text-white shadow-xl backdrop-blur">
-      <h2 className="text-sm font-semibold tracking-tight">Surface shape</h2>
-      <p className="mt-0.5 text-xs text-white/50">
-        The fluid&apos;s natural surface height <span className="font-mono">h(x, z)</span> in grid units
+    <div>
+      <p className="text-xs text-white/50">
+        Surface height <span className="font-mono">h(x, z)</span> on the y axis (0–{AXIS_MAX})
       </p>
 
-      <div className="mt-3 flex gap-2">
+      <div className="mt-2 flex gap-2">
         <input
           value={text}
           onChange={(e) => setText(e.target.value)}
           onKeyDown={(e) => e.key === "Enter" && apply(text)}
           spellCheck={false}
           autoComplete="off"
+          placeholder="e.g. 40+15*sin(x/15)*cos(z/15)"
           aria-label="Surface height expression in x and z"
           className="min-w-0 flex-1 rounded-lg border border-white/15 bg-black/30 px-2.5 py-1.5 font-mono text-sm outline-none focus:border-sky-400/70"
         />
@@ -104,6 +113,8 @@ export default function SurfacePanel({ onApply }: { onApply: (fn: SurfaceFn | nu
       <p className={"mt-1 h-4 text-xs " + (compiled.ok ? "text-white/40" : "text-red-300")}>
         {compiled.ok ? (text === applied ? "Applied" : "Press Enter or Apply") : compiled.error}
       </p>
+
+      {advice && <p className="mt-1 text-[11px] leading-snug text-amber-200/85">{advice}</p>}
 
       <div className="mt-2 flex flex-wrap gap-1.5">
         {PRESETS.map((p) => (
@@ -135,21 +146,123 @@ export default function SurfacePanel({ onApply }: { onApply: (fn: SurfaceFn | nu
           style={{ imageRendering: "auto" }}
         />
       </div>
-      <p className="mt-1 text-center text-[10px] text-white/40">x →</p>
+      <p className="mt-1 text-center text-[10px] text-white/40">
+        x →{stats && Number.isFinite(stats.min) ? ` · h from ${stats.min.toFixed(1)} to ${stats.max.toFixed(1)}` : ""}
+      </p>
       <div
         className="mx-auto mt-1 h-2 w-full rounded-full"
         style={{ background: "linear-gradient(to right, #17306b, #e8f6ff, #ffb347)" }}
       />
       <div className="mt-0.5 flex justify-between text-[10px] text-white/40">
-        <span>−{CLIP_LABEL}</span>
         <span>0</span>
-        <span>+{CLIP_LABEL}</span>
+        <span>{AXIS_MAX / 2}</span>
+        <span>{AXIS_MAX}</span>
       </div>
       <p className="mt-2 text-[10px] leading-snug text-white/35">
-        Top-down view of the grid floor: x and z run 0–{AXIS_MAX}, and h is height in y-axis units. Use
-        x, z, pi, e, + − * / ^ and sin, cos, sqrt, exp, abs, min, max… Heights beyond ±{CLIP_LABEL} are
-        clipped.
+        Top-down view of the grid floor (x and z run 0–{AXIS_MAX}); colour is height. The water fills up to
+        the graph, and the number of points follows the volume under it. Use x, z, pi, e, + − * / ^ and
+        sin, cos, sqrt, exp, abs, min, max…
       </p>
+    </div>
+  );
+}
+
+type PanelProps = {
+  fluids: FluidEntry[];
+  maxFluids: number;
+  onAdd: () => void;
+  onRemove: (id: number) => void;
+  onColor: (id: number, color: string) => void;
+  onApply: (id: number, expr: string, fn: SurfaceFn) => void;
+};
+
+/** Fluid selector (add / remove / colour) plus the surface graph editor for the selected fluid. */
+export default function SurfacePanel({ fluids, maxFluids, onAdd, onRemove, onColor, onApply }: PanelProps) {
+  const [selectedId, setSelectedId] = useState(fluids[0].id);
+  const [open, setOpen] = useState(true);
+  const selectedIndex = Math.max(
+    0,
+    fluids.findIndex((f) => f.id === selectedId),
+  );
+  const selected = fluids[selectedIndex];
+  const full = fluids.length >= maxFluids;
+
+  return (
+    <div className="absolute right-5 top-5 max-h-[calc(100vh-2.5rem)] w-72 select-none overflow-y-auto rounded-2xl border border-white/15 bg-[#0b1226]/80 p-4 text-white shadow-xl backdrop-blur">
+      <div className="flex items-center justify-between">
+        <h2 className="text-sm font-semibold tracking-tight">
+          Fluids <span className="font-normal text-white/40">{fluids.length}/{maxFluids}</span>
+        </h2>
+        <button
+          onClick={() => setOpen((o) => !o)}
+          aria-label={open ? "Collapse panel" : "Expand panel"}
+          className="rounded-md px-2 text-white/60 transition hover:bg-white/10 hover:text-white"
+        >
+          {open ? "−" : "+"}
+        </button>
+      </div>
+
+      {open && (
+        <>
+          <div className="mt-2 flex flex-wrap items-center gap-1.5">
+            {fluids.map((f, i) => (
+              <button
+                key={f.id}
+                onClick={() => setSelectedId(f.id)}
+                aria-label={`Select fluid ${i + 1}`}
+                aria-pressed={f.id === selected.id}
+                className={
+                  "flex h-7 items-center gap-1.5 rounded-full border px-2.5 text-xs transition " +
+                  (f.id === selected.id
+                    ? "border-sky-400/70 bg-sky-400/20"
+                    : "border-white/15 bg-white/5 hover:bg-white/15")
+                }
+              >
+                <span className="h-2.5 w-2.5 rounded-full" style={{ background: f.color }} />
+                {i + 1}
+              </button>
+            ))}
+            <button
+              onClick={onAdd}
+              disabled={full}
+              aria-label="Add fluid"
+              title={full ? `Maximum of ${maxFluids} fluids` : "Add a fluid"}
+              className="flex h-7 w-7 items-center justify-center rounded-full border border-white/15 bg-white/5 text-sm transition enabled:hover:bg-white/15 disabled:opacity-35"
+            >
+              +
+            </button>
+          </div>
+
+          <div className="mt-3 flex items-center justify-between gap-2 border-t border-white/10 pt-3">
+            <label className="flex items-center gap-2 text-xs text-white/60">
+              Fluid {selectedIndex + 1}
+              <span className="text-white/35">· {selected.sim.count} pts</span>
+              <input
+                type="color"
+                value={selected.color}
+                onChange={(e) => onColor(selected.id, e.target.value)}
+                aria-label={`Colour of fluid ${selectedIndex + 1}`}
+                className="h-6 w-8 cursor-pointer rounded border border-white/20 bg-transparent p-0"
+              />
+            </label>
+            <button
+              onClick={() => onRemove(selected.id)}
+              disabled={fluids.length <= 1}
+              className="rounded-lg border border-white/15 px-2.5 py-1 text-xs text-white/70 transition enabled:hover:bg-red-500/20 enabled:hover:text-red-200 disabled:opacity-35"
+            >
+              Remove
+            </button>
+          </div>
+
+          <div className="mt-3">
+            <SurfaceEditor
+              key={selected.id}
+              initialExpr={selected.expr}
+              onApply={(expr, fn) => onApply(selected.id, expr, fn)}
+            />
+          </div>
+        </>
+      )}
     </div>
   );
 }

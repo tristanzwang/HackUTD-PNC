@@ -17,34 +17,60 @@ export const TANK = {
 
 const MAX_NEIGHBORS = 80;
 
-/** Surface-shape grid: resolution over the tank footprint, height clip and slope clip. */
+/** Surface-height grid: resolution over the tank footprint, height clip and slope clip. */
 const SURF_N = 49;
-export const MAX_SURFACE_HEIGHT = 0.5;
+/** Tallest surface a graph can ask for (the tank is 1.4 tall; leave a little headroom). */
+export const MAX_SURFACE_HEIGHT = TANK.maxY - 0.05;
 const MAX_SLOPE = 1.2;
-
-/** Default fluid block: particles per axis and rest spacing. */
-export const BLOCK = { nx: 18, ny: 8, nz: 18, spacing: 0.082 };
+const WALL_MARGIN = 0.02; // particles are kept this far inside the walls
+const INTERIOR_AREA = (TANK.maxX - TANK.minX - 2 * WALL_MARGIN) * (TANK.maxZ - TANK.minZ - 2 * WALL_MARGIN);
+/** Never fewer nodes than this, so a near-zero graph still shows a thin sheet of fluid. */
+const MIN_NODES = 60;
+/**
+ * Settled depth of a column of fluid whose particles would fill nominal depth x
+ * at spacing^3 each: top = K1*x - K2*x^3. K1 > 1 because settled particles sit a
+ * little further apart than the lattice; K2 because deep fluid compresses under
+ * its own weight. Fitted to simulations of flat pools (error ~1 unit on the 0-100
+ * axis); nominalDepth() inverts it so the top of the point cloud lands on the graph.
+ */
+const DEPTH_K1 = 1.2;
+const DEPTH_K2 = 0.1264;
+function nominalDepth(top: number) {
+  if (top <= 0) return 0;
+  let x = top / DEPTH_K1;
+  for (let i = 0; i < 6; i++) {
+    const f = x * (DEPTH_K1 - DEPTH_K2 * x * x) - top;
+    x -= f / (DEPTH_K1 - 3 * DEPTH_K2 * x * x);
+  }
+  return Math.max(x, 0);
+}
+const DEFAULT_LEVEL = 0.56; // initial fluid depth (40 on the 0-100 axis)
 
 export class FluidSim {
-  readonly count: number;
+  /** Active particles: scales with the volume under the surface graph (see setSurface). */
+  count = 0;
+  /** Buffer size; `count` never exceeds it. */
+  readonly capacity: number;
   readonly pos: Float32Array;
   readonly vel: Float32Array;
   /** 1 = particle is stuck in place (no longer fluid) until unpinned. */
   readonly pinned: Uint8Array;
-  private spacing: number;
-  /** Surface-shape height & slope grids (see setSurface). */
+  /** Rest spacing between particles; shrinks/grows only when the fluid outgrows its budget. */
+  spacing: number;
+  private baseSpacing: number;
+  /** Smoothing radius, kept at ~2.3x the particle spacing. */
+  h: number;
+  /** Surface height (metres above the floor) and slope grids; see setSurface. */
   private surfH = new Float32Array(SURF_N * SURF_N);
   private surfGX = new Float32Array(SURF_N * SURF_N);
   private surfGZ = new Float32Array(SURF_N * SURF_N);
-  private hasSurface = false;
+  private hasTilt = false;
   private held: number[] = [];
   private heldOff: number[] = [];
   private heldMin = [0, 0, 0];
   private heldMax = [0, 0, 0];
   private prev: Float32Array;
 
-  /** Smoothing radius, kept at ~2.3x the particle spacing. */
-  readonly h: number;
   private rho0 = 1;
   gravity = 7;
   stiffness = 30;
@@ -53,45 +79,52 @@ export class FluidSim {
   maxSpeed = 7;
 
   // spatial hash
-  private cellSize: number;
-  private gx: number;
-  private gy: number;
-  private gz: number;
-  private cellStart: Int32Array;
+  private cellSize = 0.2;
+  private gx = 1;
+  private gy = 1;
+  private gz = 1;
+  private cellStart = new Int32Array(2);
   private cellItems: Int32Array;
   private cellOf: Int32Array;
   private nbrs: Int32Array;
   private nbrCount: Int32Array;
 
-  constructor(nx = BLOCK.nx, ny = BLOCK.ny, nz = BLOCK.nz, spacing = BLOCK.spacing) {
+  constructor(capacity = 2400, spacing = 0.097) {
+    this.capacity = capacity;
+    this.baseSpacing = spacing;
     this.spacing = spacing;
     this.h = spacing * 2.3;
-    this.count = nx * ny * nz;
-    const n = this.count;
+    const n = capacity;
     this.pos = new Float32Array(n * 3);
     this.vel = new Float32Array(n * 3);
     this.pinned = new Uint8Array(n);
     this.prev = new Float32Array(n * 3);
-
-    this.cellSize = this.h;
-    this.gx = Math.ceil((TANK.maxX - TANK.minX) / this.cellSize) + 1;
-    this.gy = Math.ceil((TANK.maxY - TANK.minY) / this.cellSize) + 1;
-    this.gz = Math.ceil((TANK.maxZ - TANK.minZ) / this.cellSize) + 1;
-    const cells = this.gx * this.gy * this.gz;
-    this.cellStart = new Int32Array(cells + 1);
     this.cellItems = new Int32Array(n);
     this.cellOf = new Int32Array(n);
     this.nbrs = new Int32Array(n * MAX_NEIGHBORS);
     this.nbrCount = new Int32Array(n);
 
-    this.reset();
+    this.setSurface(() => DEFAULT_LEVEL);
+  }
+
+  /** Re-derive everything that depends on the particle spacing. */
+  private configure(spacing: number) {
+    this.spacing = spacing;
+    this.h = spacing * 2.3;
+    // displacements scale with the smoothing radius, so keep the response consistent
+    this.stiffness = 30 * (spacing / 0.082);
+    this.stiffnessNear = 60 * (spacing / 0.082);
+    this.cellSize = this.h;
+    this.gx = Math.ceil((TANK.maxX - TANK.minX) / this.cellSize) + 1;
+    this.gy = Math.ceil((TANK.maxY - TANK.minY) / this.cellSize) + 1;
+    this.gz = Math.ceil((TANK.maxZ - TANK.minZ) / this.cellSize) + 1;
+    this.cellStart = new Int32Array(this.gx * this.gy * this.gz + 1);
     this.calibrate();
   }
 
   /**
-   * Fill the tank with fluid that falls and sloshes into place. The fluid
-   * volume is filled up to a level surface shaped like the current surface
-   * graph h(x, z), so it starts out close to its resting shape.
+   * Refill the tank with the current number of particles, up to the current
+   * surface graph, so the fluid falls and sloshes into its resting shape.
    */
   reset() {
     const s = this.spacing;
@@ -100,7 +133,7 @@ export class FluidSim {
     const levels = Math.floor((TANK.maxY - TANK.minY - 2 * m) / s) + 1;
     const x0 = -(cols - 1) * s * 0.5;
 
-    // lattice candidates, lowest "height above the shaped surface" first
+    // lattice candidates, lowest "height above the surface graph" first
     const cand: { x: number; y: number; z: number; key: number }[] = [];
     for (let k = 0; k < levels; k++)
       for (let j = 0; j < cols; j++)
@@ -111,6 +144,7 @@ export class FluidSim {
     cand.sort((a, b) => a.key - b.key);
 
     const n = Math.min(this.count, cand.length);
+    this.count = n;
     let top = 0;
     for (let i = 0; i < n; i++) top = Math.max(top, cand[i].y);
     const lift = Math.max(0, Math.min(0.25, TANK.maxY - m - top)); // drop in from slightly above
@@ -126,24 +160,29 @@ export class FluidSim {
   }
 
   /**
-   * Set the natural shape of the fluid surface: its resting surface becomes
-   * y = h(x, z) + level, where the level comes from the fluid volume.
-   * Done with a body force a = g * (h_x, -1, h_z), i.e. gravity perpendicular
-   * to the shaped surface, so fluid pools toward high parts of h.
-   * Pass null for a flat surface. Heights are clipped to ±MAX_SURFACE_HEIGHT.
+   * Set the fluid's surface: fn(x, z) is the height in metres above the floor
+   * (clipped to 0..MAX_SURFACE_HEIGHT), so the settled surface sits at y = fn(x, z).
+   *
+   * The number of particles follows the volume under the graph (more fluid =
+   * more nodes, up to this fluid's capacity, beyond which spacing grows
+   * instead), then the fluid is refilled and drops into place. Non-flat
+   * surfaces use a body force a = g * (h_x, -1, h_z), i.e. gravity
+   * perpendicular to the surface, so the resting surface follows the graph.
    */
-  setSurface(fn: SurfaceFn | null) {
+  setSurface(fn: SurfaceFn) {
     const N = SURF_N;
     const w = TANK.maxX - TANK.minX, d = TANK.maxZ - TANK.minZ;
     const dx = w / (N - 1), dz = d / (N - 1);
     const H = this.surfH;
+    let sumDepth = 0; // nominal depth, summed over the grid's columns
     for (let k = 0; k < N; k++)
       for (let i = 0; i < N; i++) {
-        const v = fn ? fn(TANK.minX + i * dx, TANK.minZ + k * dz) : 0;
-        H[k * N + i] = Number.isFinite(v)
-          ? Math.max(-MAX_SURFACE_HEIGHT, Math.min(MAX_SURFACE_HEIGHT, v))
-          : 0;
+        const v = fn(TANK.minX + i * dx, TANK.minZ + k * dz);
+        const h = Number.isFinite(v) ? Math.max(0, Math.min(MAX_SURFACE_HEIGHT, v)) : 0;
+        H[k * N + i] = h;
+        sumDepth += nominalDepth(h);
       }
+    let maxSlope = 0;
     for (let k = 0; k < N; k++)
       for (let i = 0; i < N; i++) {
         const i0 = Math.max(i - 1, 0), i1 = Math.min(i + 1, N - 1);
@@ -155,10 +194,24 @@ export class FluidSim {
           gx *= MAX_SLOPE / sl;
           gz *= MAX_SLOPE / sl;
         }
+        maxSlope = Math.max(maxSlope, Math.min(sl, MAX_SLOPE));
         this.surfGX[k * N + i] = gx;
         this.surfGZ[k * N + i] = gz;
       }
-    this.hasSurface = fn !== null;
+    this.hasTilt = maxSlope > 1e-6;
+
+    // How much fluid fills the space under the graph (in particle volumes)?
+    const nominalVolume = INTERIOR_AREA * (sumDepth / (N * N));
+    let sp = this.baseSpacing;
+    let n = Math.round(nominalVolume / sp ** 3);
+    if (n > this.capacity) {
+      // more fluid than this slot's budget: keep the node count, widen the spacing
+      sp = Math.cbrt(nominalVolume / this.capacity);
+      n = this.capacity;
+    }
+    this.configure(sp);
+    this.count = Math.max(MIN_NODES, n);
+    this.reset();
   }
 
   /** Bilinear lookup in one of the surface grids. */
@@ -175,35 +228,30 @@ export class FluidSim {
     return (a * (1 - fu) + b * fu) * (1 - fv) + (c * (1 - fu) + e * fu) * fv;
   }
 
-  /** Height offset h(x, z) of the shaped surface (0 when flat). */
+  /** Surface height (metres above the floor) the graph asks for at (x, z). */
   surfaceHeight(x: number, z: number) {
-    return this.hasSurface ? this.sampleSurface(this.surfH, x, z) : 0;
+    return this.sampleSurface(this.surfH, x, z);
   }
 
-  /** Rest density = density of a particle in the interior of the initial lattice. */
+  /**
+   * Rest density: the density of a particle inside an infinite cubic lattice
+   * at the rest spacing. (Independent of how much fluid there is, so thin
+   * fluids with no fully-surrounded particles are still calibrated correctly.)
+   */
   private calibrate() {
-    this.buildNeighbors();
-    const h = this.h;
-    let best = 0;
-    for (let i = 0; i < this.count; i++) {
-      let rho = 0;
-      for (let k = 0; k < this.nbrCount[i]; k++) {
-        const j = this.nbrs[i * MAX_NEIGHBORS + k];
-        const r = this.dist(i, j);
-        const q = 1 - r / h;
-        rho += q * q;
-      }
-      if (rho > best) best = rho;
-    }
-    this.rho0 = best;
-  }
-
-  private dist(i: number, j: number) {
-    const p = this.pos;
-    const dx = p[j * 3] - p[i * 3];
-    const dy = p[j * 3 + 1] - p[i * 3 + 1];
-    const dz = p[j * 3 + 2] - p[i * 3 + 2];
-    return Math.sqrt(dx * dx + dy * dy + dz * dz);
+    const { spacing: sp, h } = this;
+    let rho = 0;
+    for (let i = -3; i <= 3; i++)
+      for (let j = -3; j <= 3; j++)
+        for (let k = -3; k <= 3; k++) {
+          if (i === 0 && j === 0 && k === 0) continue;
+          const r = sp * Math.sqrt(i * i + j * j + k * k);
+          if (r < h) {
+            const q = 1 - r / h;
+            rho += q * q;
+          }
+        }
+    this.rho0 = rho;
   }
 
   private cellIndex(x: number, y: number, z: number) {
@@ -265,7 +313,7 @@ export class FluidSim {
     for (let i = 0; i < n; i++) {
       if (pinned[i]) continue;
       vel[i * 3 + 1] -= g;
-      if (this.hasSurface) {
+      if (this.hasTilt) {
         // tilt gravity to be perpendicular to the shaped surface
         const px = pos[i * 3], pz = pos[i * 3 + 2];
         vel[i * 3] += g * this.sampleSurface(this.surfGX, px, pz);
@@ -409,6 +457,30 @@ export class FluidSim {
 
 
   /**
+   * Distance along a ray to the first particle within `radius` of it, or
+   * Infinity if the ray misses. Used to find which fluid the cursor touches.
+   */
+  probe(
+    origin: [number, number, number],
+    dir: [number, number, number],
+    radius: number,
+  ): number {
+    const { count: n, pos } = this;
+    const [ox, oy, oz] = origin;
+    const [dx, dy, dz] = dir;
+    const r2 = radius * radius;
+    let tMin = Infinity;
+    for (let i = 0; i < n; i++) {
+      const rx = pos[i * 3] - ox, ry = pos[i * 3 + 1] - oy, rz = pos[i * 3 + 2] - oz;
+      const t = rx * dx + ry * dy + rz * dz;
+      if (t < 0) continue;
+      const cx = rx - dx * t, cy = ry - dy * t, cz = rz - dz * t;
+      if (cx * cx + cy * cy + cz * cz < r2 && t < tMin) tMin = t;
+    }
+    return tMin;
+  }
+
+  /**
    * Grab the globule of particles under a ray (stuck ones included) and make
    * them kinematic so they can be dragged with moveGrab(). Returns the globule
    * centre, or null if the ray misses the fluid.
@@ -422,16 +494,8 @@ export class FluidSim {
     const { count: n, pos } = this;
     const [ox, oy, oz] = origin;
     const [dx, dy, dz] = dir;
-    const r2 = rayRadius * rayRadius;
 
-    let tMin = Infinity;
-    for (let i = 0; i < n; i++) {
-      const rx = pos[i * 3] - ox, ry = pos[i * 3 + 1] - oy, rz = pos[i * 3 + 2] - oz;
-      const t = rx * dx + ry * dy + rz * dz;
-      if (t < 0) continue;
-      const cx = rx - dx * t, cy = ry - dy * t, cz = rz - dz * t;
-      if (cx * cx + cy * cy + cz * cz < r2 && t < tMin) tMin = t;
-    }
+    const tMin = this.probe(origin, dir, rayRadius);
     if (tMin === Infinity) return null;
 
     // centre sits slightly inside the surface layer that was hit
@@ -511,14 +575,7 @@ export class FluidSim {
     const [dx, dy, dz] = dir;
     const r2 = radius * radius;
 
-    let tMin = Infinity;
-    for (let i = 0; i < n; i++) {
-      const rx = pos[i * 3] - ox, ry = pos[i * 3 + 1] - oy, rz = pos[i * 3 + 2] - oz;
-      const t = rx * dx + ry * dy + rz * dz;
-      if (t < 0) continue;
-      const cx = rx - dx * t, cy = ry - dy * t, cz = rz - dz * t;
-      if (cx * cx + cy * cy + cz * cz < r2 && t < tMin) tMin = t;
-    }
+    const tMin = this.probe(origin, dir, radius);
     if (tMin === Infinity) return null;
 
     for (let i = 0; i < n; i++) {
