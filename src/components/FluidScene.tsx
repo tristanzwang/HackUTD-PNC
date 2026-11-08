@@ -1175,7 +1175,19 @@ function FluidDock({
 
 // ---------------------------------------------------------------------------
 
-export default function FluidScene() {
+/** Signals a rendered scene, rather than just a downloaded JavaScript chunk. */
+function SceneReady({ onReady }: { onReady?: () => void }) {
+  const reported = useRef(false);
+  useFrame(() => {
+    if (!reported.current) {
+      reported.current = true;
+      onReady?.();
+    }
+  });
+  return null;
+}
+
+export default function FluidScene({ onReady }: { onReady?: () => void }) {
   const nextId = useRef(1);
   const [fluids, setFluids] = useState<FluidEntry[]>(() => [
     createFluid(0, 0, FLUID_COLORS[0]),
@@ -1325,6 +1337,7 @@ export default function FluidScene() {
           dpr={[1, 2]}
           style={{ touchAction: "none", cursor: "crosshair" }}
         >
+          <SceneReady onReady={onReady} />
           <color attach="background" args={[BG]} />
           <fog attach="fog" args={[BG, 3, 8]} />
           <ambientLight intensity={0.7} />

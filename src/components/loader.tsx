@@ -5,7 +5,7 @@ import { useCallback, useState } from "react";
 import Intro from "./intro";
 
 // WebGL only exists in the browser, so skip server rendering for the scene.
-const FluidScene = dynamic(() => import("./scene"), { ssr: false });
+const FluidScene = dynamic(() => import("./FluidScene"), { ssr: false });
 
 export default function FluidLoader() {
   const [sceneReady, setSceneReady] = useState(false);
