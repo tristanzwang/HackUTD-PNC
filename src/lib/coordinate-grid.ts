@@ -218,8 +218,9 @@ export function createCoordinateGrid(
     put(text, box.minX - off, ly, lerp(box.minZ, box.maxZ, t));
     if (t > 0) put(text, box.minX - off, lerp(box.minY, box.maxY, t), box.minZ - off);
   }
-  put("x", box.maxX + 0.17, ly, box.minZ - off, 1.5, true);
-  put("z", box.minX - off, ly, box.maxZ + 0.17, 1.5, true);
+  // the axes are swapped: the graph's z runs along world X, and its x along world Z
+  put("z", box.maxX + 0.17, ly, box.minZ - off, 1.5, true);
+  put("x", box.minX - off, ly, box.maxZ + 0.17, 1.5, true);
   put("y", box.minX - off, box.maxY + 0.15, box.minZ - off, 1.5, true);
 
   // the web font may not have arrived when the labels were first drawn: redraw once it has

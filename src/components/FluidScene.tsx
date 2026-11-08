@@ -32,6 +32,7 @@ import {
   systemRadius,
 } from "@/lib/solar-system";
 import { Spring, glide } from "@/lib/spring";
+import { SurfaceSkin } from "@/lib/surface-skin";
 import { Flourish, Orb, PageFrame } from "./Ornaments";
 import SurfacePanel from "./SurfacePanel";
 import { CHIP, FOCUS, GLASS, PRESS, collapsible } from "./ui";
@@ -50,6 +51,8 @@ const WHITE = new THREE.Color("#ffffff");
 const BG = "#070b17";
 const DEFAULT_DIMMING = 0.6;
 const DEFAULT_OVERLAP_DIMMING = 0.6;
+/** How strongly points buried below the top surface are dimmed (0 = not at all). */
+const DEFAULT_UNDER_DIMMING = 0.85;
 const TANK_CENTER = new THREE.Vector3(0, (TANK.maxY - TANK.minY) * 0.3, 0);
 const SUN_CENTER = new THREE.Vector3(0, 0, 0);
 /** Camera zoom spring: snappy, never bouncy. */
@@ -146,6 +149,7 @@ function updateLattice(
   deep: THREE.Color,
   foam: THREE.Color,
   brightness: Float32Array, // per-point multiplier (dims regions where fluids overlap)
+  under: Float32Array, // per-point multiplier (dims points buried below the top surface)
 ) {
   const { vel, pos } = sim;
   const {
@@ -170,7 +174,7 @@ function updateLattice(
       const speed = Math.hypot(vel[j], vel[j + 1], vel[j + 2]);
       c.copy(deep)
         .lerp(foam, Math.min(speed / 3.5, 1) * foamK)
-        .multiplyScalar(brightness[i]);
+        .multiplyScalar(brightness[i] * under[i]);
     }
     pc[j] = c.r;
     pc[j + 1] = c.g;
@@ -346,9 +350,11 @@ function SimDriver({
 function FluidLayer({
   fluid,
   overlap,
+  underDimming,
 }: {
   fluid: FluidEntry;
   overlap: OverlapField;
+  underDimming: number;
 }) {
   const { sim, color } = fluid;
   const buffers = useMemo(() => createBuffers(sim), [sim]);
@@ -356,7 +362,12 @@ function FluidLayer({
     () => new Float32Array(sim.capacity).fill(1),
     [sim],
   );
+  const under = useMemo(() => new Float32Array(sim.capacity).fill(1), [sim]);
   const pointsMat = useRef<THREE.PointsMaterial>(null);
+  // a translucent skin over the top layer of points, so the graph's shape reads at a glance
+  const skin = useMemo(() => new SurfaceSkin(), []);
+  useEffect(() => skin.setColor(color), [skin, color]);
+  useEffect(() => () => skin.dispose(), [skin]);
   const colors = useMemo(() => {
     const deep = new THREE.Color(color);
     return { c: new THREE.Color(), deep, foam: deep.clone().lerp(WHITE, 0.88) };
@@ -372,12 +383,24 @@ function FluidLayer({
 
   useFrame(() => {
     overlap.factors(sim, brightness);
-    updateLattice(sim, buffers, colors.c, colors.deep, colors.foam, brightness);
+    // the skin goes first: it finds the surface that the points below are dimmed against
+    skin.update(sim);
+    skin.shade(sim, under, underDimming);
+    updateLattice(
+      sim,
+      buffers,
+      colors.c,
+      colors.deep,
+      colors.foam,
+      brightness,
+      under,
+    );
     syncDrawState(buffers.pointGeo, pointsMat.current, sim);
   });
 
   return (
     <>
+      <primitive object={skin.mesh} />
       <points geometry={buffers.pointGeo} frustumCulled={false}>
         <pointsMaterial
           ref={pointsMat}
@@ -919,6 +942,8 @@ function SettingsMenu(props: {
   onDimming: (v: number) => void;
   overlapDimming: number;
   onOverlapDimming: (v: number) => void;
+  underDimming: number;
+  onUnderDimming: (v: number) => void;
   onReset: () => void;
 }) {
   const [open, setOpen] = useState(false);
@@ -975,6 +1000,11 @@ function SettingsMenu(props: {
               label="Overlap dimming"
               value={props.overlapDimming}
               onChange={props.onOverlapDimming}
+            />
+            <Slider
+              label="Below-surface dimming"
+              value={props.underDimming}
+              onChange={props.onUnderDimming}
             />
             <div className={collapsible(props.inGraph)} inert={!props.inGraph}>
               <div className="min-h-0 overflow-hidden">
@@ -1103,6 +1133,7 @@ export default function FluidScene() {
   ]);
   const [dimming, setDimming] = useState(DEFAULT_DIMMING);
   const [overlapDimming, setOverlapDimming] = useState(DEFAULT_OVERLAP_DIMMING);
+  const [underDimming, setUnderDimming] = useState(DEFAULT_UNDER_DIMMING);
   const [view, setView] = useState<View>("graph");
   const [selectedId, setSelectedId] = useState(fluids[0].id);
   const [panelOpen, setPanelOpen] = useState(false); // the sidebar opens from the legend
@@ -1184,7 +1215,12 @@ export default function FluidScene() {
           <SolarSystem conductor={conductor} count={fluids.length} />
           <OverlapUpdater fluids={fluids} overlap={overlap} />
           {fluids.map((f) => (
-            <FluidLayer key={f.id} fluid={f} overlap={overlap} />
+            <FluidLayer
+              key={f.id}
+              fluid={f}
+              overlap={overlap}
+              underDimming={underDimming}
+            />
           ))}
           <Interaction
             fluids={fluids}
@@ -1209,6 +1245,8 @@ export default function FluidScene() {
         onDimming={setDimming}
         overlapDimming={overlapDimming}
         onOverlapDimming={setOverlapDimming}
+        underDimming={underDimming}
+        onUnderDimming={setUnderDimming}
         onReset={() => fluids.forEach((f) => f.sim.reset())}
       />
 
