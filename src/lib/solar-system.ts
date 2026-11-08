@@ -1,3 +1,5 @@
+import { Spring } from "./spring";
+
 /**
  * Layout and choreography for the solar-system view: where each fluid's planet
  * orbits, how fast it goes round, and how the tank dissolves into it.
@@ -70,14 +72,19 @@ export function spinRate(index: number) {
   return (index % 2 === 0 ? 1 : -1) * (0.22 + ((index * 0.29) % 0.2));
 }
 
+/** How quickly the tank <-> system transition arrives (see Spring), in seconds. */
+export const VIEW_RESPONSE = 1.8;
+export const VIEW_RESPONSE_REDUCED = 0.15;
+
 export const clamp01 = (t: number) => (t < 0 ? 0 : t > 1 ? 1 : t);
 export const easeInOutCubic = (t: number) =>
   t < 0.5 ? 4 * t * t * t : 1 - Math.pow(-2 * t + 2, 3) / 2;
-export const easeOutCubic = (t: number) => 1 - Math.pow(1 - t, 3);
 
 /**
  * Splits the 0..1 view transition (0 = tank, 1 = solar system) into two
- * overlapping stages, so the water balls up before it flies out to its orbit —
+ * overlapping stages. They are linear on purpose: the transition itself is a
+ * spring, which already supplies the easing, so easing again would stack curves.
+ * The water the water balls up before it flies out to its orbit —
  * and, running backwards, comes home before it melts back into the tank.
  *
  * - `gather` drives the fluid's gravity: 0 = tank floor, 1 = a gravity point.
@@ -85,8 +92,8 @@ export const easeOutCubic = (t: number) => 1 - Math.pow(1 - t, 3);
  */
 export function transitionStages(p: number) {
   return {
-    gather: easeInOutCubic(clamp01(p / 0.55)),
-    launch: easeInOutCubic(clamp01((p - 0.25) / 0.75)),
+    gather: clamp01(p / 0.55),
+    launch: clamp01((p - 0.25) / 0.75),
   };
 }
 
@@ -94,34 +101,39 @@ export function transitionStages(p: number) {
  * Drives the tank <-> solar-system transition. It lives outside React so the
  * render loop can advance it every frame without re-rendering anything, and so
  * both views can read the same progress value.
+ *
+ * Progress is a critically damped spring, so flipping the tab mid-flight turns
+ * the motion around smoothly (it keeps its velocity) instead of snapping back.
  */
 export class ViewTransition {
-  /** 0 = tank, 1 = solar system; anything between is mid-flight. */
-  p = 0;
   /** Orbital clock, in seconds. */
   t = 0;
-  private target = 0;
+  private spring = new Spring(0, VIEW_RESPONSE);
   private homes = new Map<number, [number, number, number]>();
+
+  /** 0 = tank, 1 = solar system; anything between is mid-flight. */
+  get p() {
+    return clamp01(this.spring.value);
+  }
 
   /** Head for the tank (0) or the solar system (1). */
   setTarget(v: number) {
-    this.target = v;
+    this.spring.to(v);
+  }
+
+  /** Reduced motion: arrive almost at once, as a short cross-dissolve. */
+  setReducedMotion(reduced: boolean) {
+    this.spring.response = reduced ? VIEW_RESPONSE_REDUCED : VIEW_RESPONSE;
   }
 
   /** Which view the camera and pointer should be treated as belonging to. */
   get headingToSolar() {
-    return this.target > 0.5;
+    return this.spring.target > 0.5;
   }
 
   /** Step the transition forward and return this frame's two stages. */
-  advance(dt: number, seconds: number) {
-    if (this.p !== this.target) {
-      const step = dt / seconds;
-      this.p =
-        this.target > this.p
-          ? Math.min(this.p + step, this.target)
-          : Math.max(this.p - step, this.target);
-    }
+  advance(dt: number) {
+    this.spring.advance(dt);
     this.t += dt;
     return transitionStages(this.p);
   }

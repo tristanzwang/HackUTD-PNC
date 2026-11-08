@@ -1,7 +1,15 @@
 "use client";
 
 import { Canvas, useFrame, useThree } from "@react-three/fiber";
-import { useEffect, useMemo, useRef, useState } from "react";
+import {
+  useEffect,
+  useId,
+  useMemo,
+  useRef,
+  useState,
+  type CSSProperties,
+  type KeyboardEvent,
+} from "react";
 import * as THREE from "three";
 import { createCoordinateGrid } from "@/lib/coordinate-grid";
 import {
@@ -23,7 +31,10 @@ import {
   spinRate,
   systemRadius,
 } from "@/lib/solar-system";
+import { Spring, glide } from "@/lib/spring";
+import { Flourish, Orb, PageFrame, Sigil, roman } from "./Ornaments";
 import SurfacePanel from "./SurfacePanel";
+import { FOCUS, GLASS, PRESS, collapsible, materialize } from "./ui";
 
 const STEP = 1 / 60;
 const LINK_RATIO = 1.317; // neighbours closer than this x spacing get a lattice link
@@ -41,14 +52,23 @@ const DEFAULT_DIMMING = 0.6;
 const DEFAULT_OVERLAP_DIMMING = 0.6;
 const TANK_CENTER = new THREE.Vector3(0, (TANK.maxY - TANK.minY) * 0.3, 0);
 const SUN_CENTER = new THREE.Vector3(0, 0, 0);
-/** How long the tank <-> solar system transition takes. */
-const TRANSITION_SECONDS = 2.6;
+/** Camera zoom spring: snappy, never bouncy. */
+const ZOOM_RESPONSE = 0.28;
+/** A camera flick this slow (rad/s) has stopped. */
+const GLIDE_STOP = 0.02;
+/** Release velocity only counts if the pointer was still moving this recently (ms). */
+const FLICK_WINDOW = 90;
 /** How much tighter a planet's dots sit than the same water does in the tank. */
 const ORBIT_PACKING = 0.65;
 
 // cursor reach scales with a fluid's particle spacing so sparse fluids stay grabbable
 const splashRadius = (sim: FluidSim) => Math.max(0.16, 1.8 * sim.spacing);
 const grabRadius = (sim: FluidSim) => Math.max(0.22, 2.3 * sim.spacing); // size of the globule you pick up
+// Straight down (phi 0) would make the camera's up vector degenerate, so stop a hair short.
+const TOP_DOWN = 0.03;
+const PHI_MIN = 0.02;
+const PHI_MAX = Math.PI / 2 - 0.02;
+const activeViewOf = (c: ViewTransition) => (c.headingToSolar ? 1 : 0);
 const grabRayRadius = (sim: FluidSim) => Math.max(0.12, 1.3 * sim.spacing);
 
 export type View = "tank" | "solar";
@@ -251,7 +271,7 @@ function SimDriver({
     const c = conductor;
     const { fluids: list } = live.current;
 
-    const { gather, launch } = c.advance(d, TRANSITION_SECONDS);
+    const { gather, launch } = c.advance(d);
     c.forget(c.p === 0 ? undefined : new Set(list.map((f) => f.id)));
 
     list.forEach((f, i) => {
@@ -393,7 +413,9 @@ function SolarSystem({ conductor, count }: { conductor: ViewTransition; count: n
     live.current = count;
   }, [count]);
   useEffect(() => () => scenery.dispose(), [scenery]);
-  useFrame(() => scenery.update(conductor.p, conductor.t, live.current));
+  useFrame(({ camera }) =>
+    scenery.update(conductor.p, conductor.t, live.current, camera as THREE.PerspectiveCamera),
+  );
   return <primitive object={scenery.group} />;
 }
 
@@ -433,8 +455,14 @@ function Interaction({
   // Interaction state lives in a ref so we never re-render React per pointer event.
   const input = useRef({
     theta: 0.7, // orbit azimuth, shared by both views
-    phi: [1.15, 0.9], // polar angle, one per view
-    dist: [3.4, 9], // camera distance, one per view
+    phi: [1.15, TOP_DOWN], // polar angle, one per view (the solar view always opens top-down)
+    zoom: [new Spring(3.4, ZOOM_RESPONSE), new Spring(9, ZOOM_RESPONSE)], // camera distance, one per view
+    wasSolar: false,
+    homing: false, // the camera is swinging up to the top-down view
+    phiHome: new Spring(TOP_DOWN, 0.7),
+    vTheta: 0, // camera angular velocity (rad/s): carried into a glide on release
+    vPhi: 0,
+    lastMoveT: 0,
     dragging: false,
     grabbing: false,
     grabSim: null as FluidSim | null,
@@ -450,10 +478,8 @@ function Interaction({
 
   // frame the whole system when the solar view is picked
   useEffect(() => {
-    input.current.dist[1] = THREE.MathUtils.clamp(
-      systemRadius(fluids.length) * 1.55 + 3.2,
-      5,
-      34,
+    input.current.zoom[1].to(
+      THREE.MathUtils.clamp(systemRadius(fluids.length) * 1.55 + 3.2, 5, 34),
     );
   }, [fluids.length]);
 
@@ -461,7 +487,7 @@ function Interaction({
     const el = gl.domElement;
     const s = input.current;
     /** Which view's camera settings the pointer is editing. */
-    const activeView = () => (conductor.headingToSolar ? 1 : 0);
+    const activeView = () => activeViewOf(conductor);
 
     const setNdc = (e: PointerEvent) => {
       const r = el.getBoundingClientRect();
@@ -471,6 +497,10 @@ function Interaction({
       );
     };
     const down = (e: PointerEvent) => {
+      // touching the scene stops any glide dead, like catching a spinning globe
+      s.vTheta = 0;
+      s.vPhi = 0;
+      s.homing = false;
       // right click: everything stuck (in every fluid) turns back into fluid
       if (e.button === 2) {
         for (const f of live.current.fluids) f.sim.unpinAll();
@@ -509,18 +539,23 @@ function Interaction({
       s.dragging = true;
       s.lastX = e.clientX;
       s.lastY = e.clientY;
+      s.lastMoveT = e.timeStamp;
     };
     const move = (e: PointerEvent) => {
       setNdc(e);
       s.inside = true;
       if (s.dragging) {
         const v = activeView();
-        s.theta -= (e.clientX - s.lastX) * 0.007;
-        s.phi[v] = THREE.MathUtils.clamp(
-          s.phi[v] - (e.clientY - s.lastY) * 0.007,
-          0.15,
-          Math.PI / 2 - 0.02,
-        );
+        const dTheta = -(e.clientX - s.lastX) * 0.007;
+        const wanted = s.phi[v] - (e.clientY - s.lastY) * 0.007;
+        const phi = THREE.MathUtils.clamp(wanted, PHI_MIN, PHI_MAX);
+        // track velocity (smoothed) so a flick can carry on after release
+        const dt = Math.max(e.timeStamp - s.lastMoveT, 1) / 1000;
+        s.vTheta += (dTheta / dt - s.vTheta) * 0.4;
+        s.vPhi += ((phi - s.phi[v]) / dt - s.vPhi) * 0.4;
+        s.lastMoveT = e.timeStamp;
+        s.theta += dTheta;
+        s.phi[v] = phi;
         s.lastX = e.clientX;
         s.lastY = e.clientY;
         s.hasPrev = false;
@@ -532,6 +567,11 @@ function Interaction({
         s.grabbing = false;
         s.grabSim = null;
         el.style.cursor = "crosshair";
+      }
+      // a pause before release means "stop here"; otherwise the camera coasts on
+      if (e.timeStamp - s.lastMoveT > FLICK_WINDOW) {
+        s.vTheta = 0;
+        s.vPhi = 0;
       }
       s.dragging = false;
       s.hasPrev = false;
@@ -548,7 +588,10 @@ function Interaction({
       e.preventDefault();
       const v = activeView();
       const [lo, hi] = v === 0 ? [1.8, 7] : [3, 45];
-      s.dist[v] = THREE.MathUtils.clamp(s.dist[v] * Math.exp(e.deltaY * 0.001), lo, hi);
+      // scroll sets where the zoom is heading; the spring carries the camera there
+      const z = s.zoom[v];
+      z.to(z.target * Math.exp(e.deltaY * 0.001));
+      z.clamp(lo, hi);
     };
 
     el.addEventListener("pointerdown", down);
@@ -569,12 +612,43 @@ function Interaction({
     };
   }, [gl, camera, tmp, conductor]);
 
-  useFrame(() => {
+  useFrame((_, delta) => {
     const s = input.current;
-    const e = easeInOutCubic(conductor.p);
+    const dt = Math.min(delta, 0.1);
+    // the transition is already a spring, so progress is used as-is
+    const e = conductor.p;
+
+    // ---- entering the solar system always swings the camera to look straight down ----
+    const solar = conductor.headingToSolar;
+    if (solar && !s.wasSolar) {
+      s.phiHome.snap(s.phi[1]);
+      s.phiHome.to(TOP_DOWN);
+      s.homing = true;
+      s.vPhi = 0;
+    }
+    s.wasSolar = solar;
+    if (s.homing && !s.dragging) {
+      s.phi[1] = s.phiHome.advance(dt);
+      if (s.phiHome.settled) s.homing = false;
+    }
+
+    // ---- a released drag coasts to a stop, at scroll-deceleration rate ----
+    if (!s.dragging && (s.vTheta !== 0 || s.vPhi !== 0)) {
+      const v = activeViewOf(conductor);
+      s.theta += s.vTheta * dt;
+      const phi = THREE.MathUtils.clamp(s.phi[v] + s.vPhi * dt, PHI_MIN, PHI_MAX);
+      if (phi !== s.phi[v] + s.vPhi * dt) s.vPhi = 0; // hit the pole: stop that axis
+      s.phi[v] = phi;
+      s.vTheta = glide(s.vTheta, dt);
+      s.vPhi = glide(s.vPhi, dt);
+      if (Math.abs(s.vTheta) < GLIDE_STOP) s.vTheta = 0;
+      if (Math.abs(s.vPhi) < GLIDE_STOP) s.vPhi = 0;
+    }
 
     // ---- camera: eases from framing the tank to framing the whole system ----
-    const dist = s.dist[0] + (s.dist[1] - s.dist[0]) * e;
+    const d0 = s.zoom[0].advance(dt);
+    const d1 = s.zoom[1].advance(dt);
+    const dist = d0 + (d1 - d0) * e;
     const phi = s.phi[0] + (s.phi[1] - s.phi[0]) * e;
     tmp.target.copy(TANK_CENTER).lerp(SUN_CENTER, e);
     const sp = Math.sin(phi);
@@ -650,69 +724,239 @@ function Interaction({
 // chrome
 // ---------------------------------------------------------------------------
 
+/** Segmented control with an indicator that glides between the two views. */
 function ViewTabs({ view, onChange }: { view: View; onChange: (v: View) => void }) {
   const tabs: { id: View; label: string }[] = [
     { id: "tank", label: "Tank" },
     { id: "solar", label: "Solar system" },
   ];
+  const refs = useRef<Record<string, HTMLButtonElement | null>>({});
+  // arrow keys move between tabs, as in any native segmented control
+  const onKeyDown = (e: KeyboardEvent<HTMLDivElement>) => {
+    if (e.key !== "ArrowLeft" && e.key !== "ArrowRight") return;
+    e.preventDefault();
+    const next: View = view === "tank" ? "solar" : "tank";
+    onChange(next);
+    refs.current[next]?.focus();
+  };
   return (
-    <div
-      role="tablist"
-      aria-label="View"
-      className="absolute left-1/2 top-5 flex -translate-x-1/2 select-none gap-1 rounded-full border border-white/15 bg-[#0b1226]/80 p-1 backdrop-blur"
-    >
-      {tabs.map((t) => (
-        <button
-          key={t.id}
-          role="tab"
-          aria-selected={view === t.id}
-          onClick={() => onChange(t.id)}
+    <div className="rise pointer-events-none absolute inset-x-0 top-5 flex items-center justify-center gap-3 px-8">
+      <Flourish side="left" />
+      <div
+        role="tablist"
+        aria-label="View"
+        onKeyDown={onKeyDown}
+        className={
+          "pointer-events-auto relative grid select-none grid-cols-2 rounded-full p-1 " + GLASS
+        }
+      >
+        <span
+          aria-hidden
           className={
-            "rounded-full px-4 py-1.5 text-sm transition duration-300 " +
-            (view === t.id
-              ? "bg-white/90 text-[#0b1226] shadow"
-              : "text-white/60 hover:bg-white/10 hover:text-white")
+            "absolute inset-y-1 left-1 w-[calc(50%-0.25rem)] rounded-full " +
+            "bg-white/90 " +
+            "shadow-[0_1px_8px_rgba(0,0,0,0.35)] transition-[translate] duration-500 " +
+            "ease-[cubic-bezier(0.32,0.72,0,1)] motion-reduce:duration-150 " +
+            (view === "solar" ? "translate-x-full" : "")
           }
-        >
-          {t.label}
-        </button>
-      ))}
+        />
+        {tabs.map((t) => (
+          <button
+            key={t.id}
+            ref={(el) => {
+              refs.current[t.id] = el;
+            }}
+            role="tab"
+            aria-selected={view === t.id}
+            tabIndex={view === t.id ? 0 : -1}
+            onClick={() => onChange(t.id)}
+            className={
+              "relative z-10 rounded-full px-6 py-1.5 text-[1.05rem] font-semibold tracking-[0.02em] " +
+              "transition-colors duration-300 active:opacity-70 " +
+              FOCUS +
+              " " +
+              (view === t.id ? "text-[#0b1226]" : "text-white/65 hover:text-white")
+            }
+          >
+            {t.label}
+          </button>
+        ))}
+      </div>
+      <Flourish side="right" />
     </div>
   );
 }
 
-/** Which planet is which, and how big it is. The groundwork for showing amounts. */
-function SolarLegend({ fluids }: { fluids: FluidEntry[] }) {
-  const total = fluids.reduce((a, f) => a + f.sim.count, 0) || 1;
+function Slider({
+  label,
+  value,
+  onChange,
+}: {
+  label: string;
+  value: number;
+  onChange: (v: number) => void;
+}) {
   return (
-    <div className="absolute right-5 top-5 w-64 select-none rounded-2xl border border-white/15 bg-[#0b1226]/80 p-4 text-white shadow-xl backdrop-blur">
-      <h2 className="text-sm font-semibold tracking-tight">Planets</h2>
-      <p className="mt-0.5 text-xs text-white/50">
-        Each fluid becomes a world. Its size is the volume you gave it in the tank.
-      </p>
-      <ul className="mt-3 space-y-1.5">
-        {fluids.map((f, i) => (
-          <li key={f.id} className="flex items-center gap-2 text-xs">
-            <span
-              className="h-3 w-3 shrink-0 rounded-full"
-              style={{ background: f.color, boxShadow: `0 0 10px ${f.color}` }}
+    <label className="block">
+      <span className="flex items-baseline justify-between text-base text-white/80">
+        {label}
+        <span className="tabular-nums font-normal text-white/40">{Math.round(value * 100)}</span>
+      </span>
+      <input
+        type="range"
+        min={0}
+        max={1}
+        step={0.05}
+        value={value}
+        onChange={(e) => onChange(parseFloat(e.target.value))}
+        aria-label={label}
+        className="slider mt-1.5 w-full"
+        style={{ "--fill": `${value * 100}%` } as CSSProperties}
+      />
+    </label>
+  );
+}
+
+/** The two dimming sliders, tucked behind a disclosure so the scene stays the hero. */
+function DisplayControls(props: {
+  dimming: number;
+  onDimming: (v: number) => void;
+  overlapDimming: number;
+  onOverlapDimming: (v: number) => void;
+}) {
+  const [open, setOpen] = useState(false);
+  const panelId = useId();
+  return (
+    <div
+      className={
+        "rise absolute bottom-5 left-5 w-64 select-none overflow-hidden rounded-[1.25rem] text-white " +
+        GLASS
+      }
+    >
+      <button
+        onClick={() => setOpen((o) => !o)}
+        aria-expanded={open}
+        aria-controls={panelId}
+        className={
+          "flex w-full items-center justify-between px-4 py-2.5 text-[1.05rem] font-semibold " +
+          "tracking-[0.02em] transition-colors hover:bg-white/[0.06] active:bg-white/10 " +
+          FOCUS
+        }
+      >
+        <span className="flex items-center gap-2">
+          <Sigil size={16} />
+          Display
+        </span>
+        <svg
+          width="12"
+          height="12"
+          viewBox="0 0 12 12"
+          aria-hidden
+          className={
+            "text-white/50 transition-[rotate] duration-500 ease-[cubic-bezier(0.32,0.72,0,1)] " +
+            (open ? "rotate-180" : "")
+          }
+        >
+          <path
+            d="M2.5 4.5 6 8l3.5-3.5"
+            fill="none"
+            stroke="currentColor"
+            strokeWidth="1.6"
+            strokeLinecap="round"
+            strokeLinejoin="round"
+          />
+        </svg>
+      </button>
+      <div id={panelId} className={collapsible(open)} inert={!open}>
+        <div className="min-h-0 overflow-hidden">
+          <div className="space-y-3.5 px-4 pb-4 pt-1">
+            <Slider label="Depth dimming" value={props.dimming} onChange={props.onDimming} />
+            <Slider
+              label="Overlap dimming"
+              value={props.overlapDimming}
+              onChange={props.onOverlapDimming}
             />
-            <span className="w-14 shrink-0 text-white/80">Orbit {i + 1}</span>
-            <span className="h-1.5 flex-1 overflow-hidden rounded-full bg-white/10">
-              <span
-                className="block h-full rounded-full transition-[width] duration-700"
-                style={{ width: `${(f.sim.count / total) * 100}%`, background: f.color }}
-              />
-            </span>
-            <span className="w-10 shrink-0 text-right tabular-nums text-white/45">
-              {Math.round((f.sim.count / total) * 100)}%
-            </span>
-          </li>
-        ))}
-      </ul>
-      <p className="mt-3 text-[10px] leading-snug text-white/35">
-        Switch back to the tank to add worlds or change how much each one holds.
-      </p>
+          </div>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+/**
+ * The compact legend: one glowing orb per fluid, always on screen. In the tank, an
+ * orb opens that fluid's sidebar; a rune button adds another fluid.
+ */
+function FluidDock({
+  fluids,
+  selectedId,
+  panelOpen,
+  inTank,
+  maxFluids,
+  onSelect,
+  onAdd,
+}: {
+  fluids: FluidEntry[];
+  selectedId: number;
+  panelOpen: boolean;
+  inTank: boolean;
+  maxFluids: number;
+  onSelect: (id: number) => void;
+  onAdd: () => void;
+}) {
+  const full = fluids.length >= maxFluids;
+  return (
+    <div
+      role="group"
+      aria-label="Fluids"
+      className={"rise absolute right-5 top-5 flex select-none items-center rounded-full p-1 " + GLASS}
+    >
+      {fluids.map((f, i) => {
+        const on = inTank && panelOpen && f.id === selectedId;
+        return (
+          <button
+            key={f.id}
+            onClick={() => onSelect(f.id)}
+            inert={!inTank}
+            aria-label={`Fluid ${i + 1}`}
+            aria-pressed={on}
+            title={inTank ? `Fluid ${roman(i + 1)}: edit` : `Orbit ${roman(i + 1)}`}
+            className={
+              "flex items-center justify-center rounded-full p-0.5 " + PRESS + " " + FOCUS +
+              " hover:bg-white/[0.07]"
+            }
+          >
+            <Orb color={f.color} selected={on} size={18} />
+          </button>
+        );
+      })}
+      {/* the add rune folds away in the solar view */}
+      <div
+        inert={!inTank}
+        className={
+          "grid transition-[grid-template-columns,opacity] duration-500 " +
+          "ease-[cubic-bezier(0.32,0.72,0,1)] motion-reduce:duration-150 " +
+          (inTank ? "grid-cols-[1fr] opacity-100" : "grid-cols-[0fr] opacity-0")
+        }
+      >
+        <div className="min-w-0 overflow-hidden">
+          <button
+            onClick={onAdd}
+            disabled={full}
+            aria-label="Add fluid"
+            title={full ? `Maximum of ${maxFluids} fluids` : "Summon another fluid"}
+            className={
+              "ml-0.5 flex h-[30px] w-[30px] items-center justify-center rounded-full border border-dashed " +
+              "border-white/45 text-white enabled:hover:bg-white/15 disabled:opacity-35 " +
+              PRESS + " " + FOCUS
+            }
+          >
+            <svg width="12" height="12" viewBox="0 0 12 12" aria-hidden>
+              <path d="M6 1v10M1 6h10" stroke="currentColor" strokeWidth="1.3" strokeLinecap="round" />
+            </svg>
+          </button>
+        </div>
+      </div>
     </div>
   );
 }
@@ -725,12 +969,23 @@ export default function FluidScene() {
   const [dimming, setDimming] = useState(DEFAULT_DIMMING);
   const [overlapDimming, setOverlapDimming] = useState(DEFAULT_OVERLAP_DIMMING);
   const [view, setView] = useState<View>("tank");
+  const [selectedId, setSelectedId] = useState(fluids[0].id);
+  const [panelOpen, setPanelOpen] = useState(false); // the sidebar opens from the legend
   const overlap = useMemo(() => new OverlapField(), []);
   const conductor = useMemo(() => new ViewTransition(), []);
   const inTank = view === "tank";
   useEffect(() => {
     conductor.setTarget(view === "solar" ? 1 : 0);
   }, [conductor, view]);
+
+  // reduced motion: the view change becomes a quick dissolve instead of a flight
+  useEffect(() => {
+    const mq = window.matchMedia("(prefers-reduced-motion: reduce)");
+    const apply = () => conductor.setReducedMotion(mq.matches);
+    apply();
+    mq.addEventListener("change", apply);
+    return () => mq.removeEventListener("change", apply);
+  }, [conductor]);
 
   const addFluid = () => {
     if (fluids.length >= MAX_FLUIDS) return;
@@ -739,9 +994,24 @@ export default function FluidScene() {
       FLUID_COLORS.find((c) => !used.has(c)) ?? FLUID_COLORS[fluids.length % FLUID_COLORS.length];
     const entry = createFluid(nextId.current++, fluids.length, color);
     setFluids((prev) => [...prev, entry]);
+    // a freshly summoned fluid opens straight to its settings
+    setSelectedId(entry.id);
+    setPanelOpen(true);
   };
-  const removeFluid = (id: number) =>
+  const removeFluid = (id: number) => {
     setFluids((prev) => (prev.length > 1 ? prev.filter((f) => f.id !== id) : prev));
+    setPanelOpen(false);
+  };
+  // clicking the open fluid's orb again folds the sidebar away
+  const selectFluid = (id: number) => {
+    setPanelOpen(!(panelOpen && id === selectedId));
+    setSelectedId(id);
+  };
+  const selectedIndex = Math.max(
+    0,
+    fluids.findIndex((f) => f.id === selectedId),
+  );
+  const closePanel = () => setPanelOpen(false);
   const setColor = (id: number, color: string) =>
     setFluids((prev) => prev.map((f) => (f.id === id ? { ...f, color } : f)));
   const applySurface = (id: number, expr: string, fn: SurfaceFn) => {
@@ -750,102 +1020,86 @@ export default function FluidScene() {
   };
 
   return (
-    <div className="relative h-screen w-screen overflow-hidden bg-[#070b17]">
-      <Canvas
-        camera={{ fov: 45, near: 0.1, far: 250, position: [2, 2, 3] }}
-        dpr={[1, 2]}
-        style={{ touchAction: "none", cursor: "crosshair" }}
-      >
-        <color attach="background" args={[BG]} />
-        <fog attach="fog" args={[BG, 3, 8]} />
-        <ambientLight intensity={0.7} />
-        <directionalLight position={[3, 5, 2]} intensity={2.2} />
-        <directionalLight position={[-3, 2, -2]} intensity={0.6} color="#7aa7ff" />
-        <SimDriver
-          fluids={fluids}
-          conductor={conductor}
-          overlap={overlap}
-          overlapDimming={overlapDimming}
-        />
-        <Tank conductor={conductor} />
-        <SolarSystem conductor={conductor} count={fluids.length} />
-        <OverlapUpdater fluids={fluids} overlap={overlap} />
-        {fluids.map((f) => (
-          <FluidLayer key={f.id} fluid={f} overlap={overlap} />
-        ))}
-        <Interaction fluids={fluids} dimming={dimming} conductor={conductor} />
-      </Canvas>
+    <div className="relative h-screen w-screen overflow-hidden bg-[#070b17] font-serif">
+      <div className="fade-in absolute inset-0">
+        <Canvas
+          camera={{ fov: 45, near: 0.1, far: 250, position: [2, 2, 3] }}
+          dpr={[1, 2]}
+          style={{ touchAction: "none", cursor: "crosshair" }}
+        >
+          <color attach="background" args={[BG]} />
+          <fog attach="fog" args={[BG, 3, 8]} />
+          <ambientLight intensity={0.7} />
+          <directionalLight position={[3, 5, 2]} intensity={2.2} />
+          <directionalLight position={[-3, 2, -2]} intensity={0.6} color="#7aa7ff" />
+          <SimDriver
+            fluids={fluids}
+            conductor={conductor}
+            overlap={overlap}
+            overlapDimming={overlapDimming}
+          />
+          <Tank conductor={conductor} />
+          <SolarSystem conductor={conductor} count={fluids.length} />
+          <OverlapUpdater fluids={fluids} overlap={overlap} />
+          {fluids.map((f) => (
+            <FluidLayer key={f.id} fluid={f} overlap={overlap} />
+          ))}
+          <Interaction fluids={fluids} dimming={dimming} conductor={conductor} />
+        </Canvas>
+      </div>
 
+      {/* a soft vignette pulls the eye to the middle */}
+      <div
+        aria-hidden
+        className="pointer-events-none absolute inset-0 bg-[radial-gradient(ellipse_at_center,transparent_55%,rgba(6,3,20,0.55)_100%)]"
+      />
+
+      <PageFrame />
       <ViewTabs view={view} onChange={setView} />
 
-      <div className="pointer-events-none absolute left-5 top-5 max-w-sm select-none text-white/80">
-        <h1 className="text-lg font-semibold tracking-tight">
-          {inTank ? "3D Fluid" : "Your system"}
-        </h1>
-        <p className="mt-1 text-sm text-white/50 transition-opacity duration-500">
-          {inTank
-            ? "Move to splash · drag a fluid to grab a blob · right-click to melt it back · drag empty space (or hold Shift) to rotate · scroll to zoom"
-            : "Every fluid has balled up into a world of the same dots. Drag to rotate · scroll to zoom · move the cursor to disturb a planet."}
-        </p>
-      </div>
+      <DisplayControls
+        dimming={dimming}
+        onDimming={setDimming}
+        overlapDimming={overlapDimming}
+        onOverlapDimming={setOverlapDimming}
+      />
 
-      <div className="absolute bottom-5 left-5 flex select-none flex-col gap-2">
-        {(
-          [
-            ["Depth dimming", dimming, setDimming],
-            ["Overlap dimming", overlapDimming, setOverlapDimming],
-          ] as const
-        ).map(([label, value, set]) => (
-          <label
-            key={label}
-            className="flex items-center justify-between gap-3 rounded-full border border-white/20 bg-white/10 px-4 py-2 text-sm text-white backdrop-blur"
-          >
-            {label}
-            <input
-              type="range"
-              min={0}
-              max={1}
-              step={0.05}
-              value={value}
-              onChange={(e) => set(parseFloat(e.target.value))}
-              aria-label={label}
-              className="w-28 accent-sky-400"
-            />
-          </label>
-        ))}
-      </div>
-
-      {/* the panels cross-fade with the view (opacity only: a transform here would
-          re-anchor the absolutely-positioned panels inside) */}
-      <div
+      <FluidDock
+        fluids={fluids}
+        selectedId={selectedId}
+        panelOpen={panelOpen}
+        inTank={inTank}
+        maxFluids={MAX_FLUIDS}
+        onSelect={selectFluid}
+        onAdd={addFluid}
+      />
+      <SurfacePanel
+        open={panelOpen && inTank}
+        fluid={fluids[selectedIndex]}
+        number={selectedIndex + 1}
+        canRemove={fluids.length > 1}
+        onClose={closePanel}
+        onRemove={removeFluid}
+        onColor={setColor}
+        onApply={applySurface}
+      />
+      <button
+        onClick={() => fluids.forEach((f) => f.sim.reset())}
+        inert={!inTank}
         className={
-          "transition-opacity duration-500 " +
-          (inTank ? "opacity-100" : "pointer-events-none opacity-0")
+          "absolute bottom-5 right-5 origin-bottom-right rounded-full px-5 py-2 text-[1.05rem] font-semibold " +
+          "tracking-[0.02em] text-white " +
+          GLASS +
+          " hover:bg-[#1a1440]/80 " +
+          PRESS +
+          " " +
+          FOCUS +
+          " " +
+          materialize(inTank)
         }
       >
-        <SurfacePanel
-          fluids={fluids}
-          maxFluids={MAX_FLUIDS}
-          onAdd={addFluid}
-          onRemove={removeFluid}
-          onColor={setColor}
-          onApply={applySurface}
-        />
-        <button
-          onClick={() => fluids.forEach((f) => f.sim.reset())}
-          className="absolute bottom-5 right-5 rounded-full border border-white/20 bg-white/10 px-4 py-2 text-sm text-white backdrop-blur transition hover:bg-white/20"
-        >
-          Drop new water
-        </button>
-      </div>
-      <div
-        className={
-          "transition-opacity duration-500 " +
-          (inTank ? "pointer-events-none opacity-0" : "opacity-100")
-        }
-      >
-        <SolarLegend fluids={fluids} />
-      </div>
+        Drop new water
+      </button>
     </div>
   );
 }

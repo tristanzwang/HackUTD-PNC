@@ -24,13 +24,17 @@ function pointsFrom(positions: Float32Array, material: THREE.PointsMaterial) {
 }
 
 /**
- * The backdrop for the solar-system view: a sun built from dots (so it matches
- * the fluids), its glow, one ring per orbit, and a starfield. Everything fades
- * in and out with the view transition.
+ * The backdrop for the solar-system view: a sun and its glow, and one ring per
+ * orbit, which fade in and out with the view transition; plus a starfield that
+ * is always there. In the tank the stars are dimmed toward the middle of the
+ * screen so they never compete with the fluid.
  */
 export function createSolarScenery(maxOrbits: number) {
   const group = new THREE.Group();
-  group.visible = false;
+  // sun, glows and rings: only drawn once the view starts to arrive
+  const solarOnly = new THREE.Group();
+  solarOnly.visible = false;
+  group.add(solarOnly);
 
   // fade bookkeeping: every material, with the opacity it should reach at full view
   const fades: { mat: THREE.Material & { opacity: number }; full: number }[] = [];
@@ -75,7 +79,7 @@ export function createSolarScenery(maxOrbits: number) {
   };
   const innerGlow = halo(INNER_GLOW, "rgba(255,226,160,0.95)", 0.16, 0.9);
   const outerGlow = halo(OUTER_GLOW, "rgba(255,168,70,0.55)", 0.02, 0.75);
-  group.add(sun);
+  solarOnly.add(sun);
 
   // ---- orbit rings ----
   const rings: THREE.LineLoop[] = [];
@@ -97,12 +101,14 @@ export function createSolarScenery(maxOrbits: number) {
     ring.rotation.x = orbitTilt(i);
     ring.frustumCulled = false;
     rings.push(ring);
-    group.add(ring);
+    solarOnly.add(ring);
   }
 
   // ---- starfield ----
   const STARS = 1400;
   const sv = new Float32Array(STARS * 3);
+  const base = new Float32Array(STARS); // each star's own brightness
+  const sc = new Float32Array(STARS * 3); // colour, rewritten every frame to dim the middle
   for (let i = 0; i < STARS; i++) {
     // a shell well outside the outermost orbit
     const u = Math.random() * 2 - 1;
@@ -112,29 +118,54 @@ export function createSolarScenery(maxOrbits: number) {
     sv[i * 3] = Math.cos(a) * s * r;
     sv[i * 3 + 1] = u * r;
     sv[i * 3 + 2] = Math.sin(a) * s * r;
+    base[i] = 0.45 + Math.random() * 0.55;
   }
   const stars = pointsFrom(
     sv,
-    track(
-      new THREE.PointsMaterial({
-        size: 0.22,
-        sizeAttenuation: true,
-        color: "#cfe0ff",
-        map: dot,
-        depthWrite: false,
-        fog: false,
-      }),
-      0.75,
-    ),
+    new THREE.PointsMaterial({
+      size: 0.22,
+      sizeAttenuation: true,
+      vertexColors: true,
+      transparent: true,
+      opacity: 0.8,
+      map: dot,
+      depthWrite: false,
+      fog: false,
+    }),
   );
+  const starColors = new THREE.BufferAttribute(sc, 3);
+  starColors.setUsage(THREE.DynamicDrawUsage);
+  stars.geometry.setAttribute("color", starColors);
+  stars.renderOrder = -2; // behind everything, fluids included
   group.add(stars);
+  const STAR = new THREE.Color("#cfe0ff");
+  const probe = new THREE.Vector3();
+  /** Radius (in screen heights from the centre) inside which tank stars are dimmest. */
+  const CLEAR = 0.3;
+  const FADE = 1.0;
+  const TANK_DIM = 0.9; // how much the centre is dimmed in the tank
 
   return {
     group,
     /** `p` is the view transition (0 = tank, 1 = solar); `t` is the orbital clock. */
-    update(p: number, t: number, orbitsInUse: number) {
-      group.visible = p > 0.002;
-      if (!group.visible) return;
+    update(p: number, t: number, orbitsInUse: number, camera: THREE.PerspectiveCamera) {
+      // dim stars near the middle of the screen, more so in the tank than in the system
+      const dim = TANK_DIM * (1 - p);
+      const aspect = camera.aspect;
+      for (let i = 0; i < STARS; i++) {
+        probe.set(sv[i * 3], sv[i * 3 + 1], sv[i * 3 + 2]).project(camera);
+        const d = Math.hypot(probe.x * aspect, probe.y);
+        const k = Math.min(Math.max((d - CLEAR) / (FADE - CLEAR), 0), 1);
+        const near = 1 - k * k * (3 - 2 * k); // 1 at the centre, 0 out toward the edges
+        const b = base[i] * (1 - dim * near);
+        sc[i * 3] = STAR.r * b;
+        sc[i * 3 + 1] = STAR.g * b;
+        sc[i * 3 + 2] = STAR.b * b;
+      }
+      starColors.needsUpdate = true;
+
+      solarOnly.visible = p > 0.002;
+      if (!solarOnly.visible) return;
       for (const f of fades) f.mat.opacity = f.full * p;
       // the sun breathes, and swells into place as the view arrives
       sun.scale.setScalar(0.35 + 0.65 * p);
