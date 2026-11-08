@@ -873,7 +873,7 @@ function ViewTabs({
 }) {
   const tabs: { id: View; label: string }[] = [
     { id: "graph", label: "Sandbox" },
-    { id: "solar", label: "Universe" },
+    { id: "solar", label: "Galaxy" },
   ];
   const refs = useRef<Record<string, HTMLButtonElement | null>>({});
   // arrow keys move between tabs, as in any native segmented control
