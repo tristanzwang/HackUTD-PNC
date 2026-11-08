@@ -1,4 +1,4 @@
-import FluidLoader from "@/components/FluidLoader";
+import FluidLoader from "@/components/loader";
 
 export default function Home() {
   return (
