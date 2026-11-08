@@ -557,6 +557,21 @@ export class FluidSim {
         vel[j] = vel[j + 1] = vel[j + 2] = 0;
         continue;
       }
+      // A numerical blow-up (e.g. during the dense balling transition) can leave a
+      // position non-finite; the speed clamp below can't catch it (NaN > x is
+      // false), so it would poison the whole geometry and trip computeBoundingSphere.
+      // Reabsorb such a particle at the gravity point instead of stripping it.
+      if (
+        !Number.isFinite(pos[j]) ||
+        !Number.isFinite(pos[j + 1]) ||
+        !Number.isFinite(pos[j + 2])
+      ) {
+        pos[j] = prev[j] = this.orbitX;
+        pos[j + 1] = prev[j + 1] = this.orbitY;
+        pos[j + 2] = prev[j + 2] = this.orbitZ;
+        vel[j] = vel[j + 1] = vel[j + 2] = 0;
+        continue;
+      }
       let vx = (pos[j] - prev[j]) * inv;
       let vy = (pos[j + 1] - prev[j + 1]) * inv;
       let vz = (pos[j + 2] - prev[j + 2]) * inv;
