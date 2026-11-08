@@ -1,7 +1,9 @@
+import FluidLoader from "@/components/FluidLoader";
+
 export default function Home() {
   return (
     <main>
-      <div>Hello world!</div>
+      <FluidLoader />
     </main>
   );
 }
