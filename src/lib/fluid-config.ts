@@ -1,3 +1,4 @@
+import type { FinanceGraph } from "./finance/graph-data";
 import { FluidSim } from "./fluid-sim";
 
 export const MAX_FLUIDS = 8;
@@ -39,6 +40,8 @@ export type FluidEntry = {
   color: string;
   /** Applied surface expression (in grid units), shown in the panel. */
   expr: string;
+  /** Set when this graph is one of the user's finance categories rather than a hand-made surface. */
+  data?: FinanceGraph;
 };
 
 /** Create the fluid that goes in slot `index` (0-based). */

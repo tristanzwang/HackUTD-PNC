@@ -75,9 +75,9 @@ export function layout(amounts: Partial<Record<CategoryKey, number>>): SceneCate
 }
 
 /** Tallest flat pool the tank accepts, on the 0-100 axis. */
-const MAX_UNITS = 92;
+export const MAX_UNITS = 92;
 /** Shortest pool that still reads as a planet rather than a speck. */
-const MIN_UNITS = 8;
+export const MIN_UNITS = 8;
 
 /**
  * Dollars -> the flat surface height to hand FluidSim.setSurface at load.
@@ -92,6 +92,12 @@ export function heightForAmount(amount: number, largestAmount: number): number {
   if (largestAmount <= 0) return MIN_UNITS;
   const t = Math.max(0, amount) / largestAmount;
   return MIN_UNITS + t * (MAX_UNITS - MIN_UNITS);
+}
+
+/** Inverse of heightForAmount: the dollars a surface height stands for (for axis labels). */
+export function amountForHeight(height: number, largestAmount: number): number {
+  const t = (height - MIN_UNITS) / (MAX_UNITS - MIN_UNITS);
+  return Math.max(0, t) * largestAmount;
 }
 
 /**
@@ -124,6 +130,14 @@ export function packingFor(amountNow: number, amountAtLoad: number, orbitPacking
 export function shares(cats: SceneCategory[]): Record<string, number> {
   const total = cats.filter((c) => !c.isDebt).reduce((a, c) => a + c.amount, 0) || 1;
   return Object.fromEntries(cats.map((c) => [c.key, c.amount / total]));
+}
+
+/** $1,240 -> "$1.2k", for tight places like axis ticks. */
+export function compactUSD(n: number): string {
+  const a = Math.abs(n);
+  if (a >= 1_000_000) return `$${(n / 1_000_000).toFixed(1)}M`;
+  if (a >= 1000) return `$${(n / 1000).toFixed(a >= 10_000 ? 0 : 1)}k`;
+  return `$${Math.round(n)}`;
 }
 
 export function formatUSD(n: number): string {

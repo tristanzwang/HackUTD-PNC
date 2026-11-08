@@ -32,8 +32,16 @@ import {
   systemRadius,
 } from "@/lib/solar-system";
 import { Spring, glide } from "@/lib/spring";
+import { SurfaceSkin } from "@/lib/surface-skin";
 import { Flourish, Orb, PageFrame } from "./Ornaments";
+import { buildFinanceScene, type FinanceScene } from "@/lib/finance/graph-data";
+import { formatUSD } from "@/lib/finance/scene-bridge";
+import { Scrub } from "@/lib/finance/scrub";
+import { gridToWorldSurface } from "@/lib/units";
+import CategoryPanel from "./CategoryPanel";
+import { AgentStatus, Scrubber } from "./FinanceUI";
 import SurfacePanel from "./SurfacePanel";
+import { useProjection } from "./useProjection";
 import { CHIP, FOCUS, GLASS, PRESS, collapsible } from "./ui";
 
 const STEP = 1 / 60;
@@ -50,6 +58,8 @@ const WHITE = new THREE.Color("#ffffff");
 const BG = "#070b17";
 const DEFAULT_DIMMING = 0.6;
 const DEFAULT_OVERLAP_DIMMING = 0.6;
+/** How strongly points buried below the top surface are dimmed (0 = not at all). */
+const DEFAULT_UNDER_DIMMING = 0.85;
 const TANK_CENTER = new THREE.Vector3(0, (TANK.maxY - TANK.minY) * 0.3, 0);
 const SUN_CENTER = new THREE.Vector3(0, 0, 0);
 /** Camera zoom spring: snappy, never bouncy. */
@@ -146,6 +156,7 @@ function updateLattice(
   deep: THREE.Color,
   foam: THREE.Color,
   brightness: Float32Array, // per-point multiplier (dims regions where fluids overlap)
+  under: Float32Array, // per-point multiplier (dims points buried below the top surface)
 ) {
   const { vel, pos } = sim;
   const {
@@ -170,7 +181,7 @@ function updateLattice(
       const speed = Math.hypot(vel[j], vel[j + 1], vel[j + 2]);
       c.copy(deep)
         .lerp(foam, Math.min(speed / 3.5, 1) * foamK)
-        .multiplyScalar(brightness[i]);
+        .multiplyScalar(brightness[i] * under[i]);
     }
     pc[j] = c.r;
     pc[j + 1] = c.g;
@@ -272,11 +283,13 @@ function SimDriver({
   conductor,
   overlap,
   overlapDimming,
+  scrub,
 }: {
   fluids: FluidEntry[];
   conductor: ViewTransition;
   overlap: OverlapField;
   overlapDimming: number;
+  scrub: Scrub;
 }) {
   const acc = useRef(0);
   const live = useRef({ fluids, overlapDimming });
@@ -303,8 +316,13 @@ function SimDriver({
     list.forEach((f, i) => {
       const sim = f.sim;
       sim.orbitBlend = gather;
-      // the ball condenses as it forms, so planets are denser than their pools
-      sim.setPacking(1 - (1 - ORBIT_PACKING) * gather);
+      // The ball condenses as it forms, so planets are denser than their pools. A
+      // finance planet is sized so its volume matches what its category is worth at
+      // the scrubbed month (radius = packing x its natural radius).
+      const orbitPacking = f.data
+        ? Math.min(Math.max(f.data.radiusAt(scrub.k) / sim.tankBallRadius, 0.2), 1.4)
+        : ORBIT_PACKING;
+      sim.setPacking(1 - (1 - orbitPacking) * gather);
       if (c.p === 0) return;
 
       // the ball forms right where the water already is, then sets off
@@ -346,9 +364,14 @@ function SimDriver({
 function FluidLayer({
   fluid,
   overlap,
+  underDimming,
+  emphasis,
 }: {
   fluid: FluidEntry;
   overlap: OverlapField;
+  underDimming: number;
+  /** 1 = normal; lower pushes this graph into the background while another is the focus. */
+  emphasis: number;
 }) {
   const { sim, color } = fluid;
   const buffers = useMemo(() => createBuffers(sim), [sim]);
@@ -356,7 +379,13 @@ function FluidLayer({
     () => new Float32Array(sim.capacity).fill(1),
     [sim],
   );
+  const under = useMemo(() => new Float32Array(sim.capacity).fill(1), [sim]);
+  const fade = useRef(1); // eases toward `emphasis`, so a change of focus is not a cut
   const pointsMat = useRef<THREE.PointsMaterial>(null);
+  // a translucent skin over the top layer of points, so the graph's shape reads at a glance
+  const skin = useMemo(() => new SurfaceSkin(), []);
+  useEffect(() => skin.setColor(color), [skin, color]);
+  useEffect(() => () => skin.dispose(), [skin]);
   const colors = useMemo(() => {
     const deep = new THREE.Color(color);
     return { c: new THREE.Color(), deep, foam: deep.clone().lerp(WHITE, 0.88) };
@@ -372,12 +401,26 @@ function FluidLayer({
 
   useFrame(() => {
     overlap.factors(sim, brightness);
-    updateLattice(sim, buffers, colors.c, colors.deep, colors.foam, brightness);
+    // the skin goes first: it finds the surface that the points below are dimmed against
+    fade.current += (emphasis - fade.current) * 0.14;
+    skin.setEmphasis(fade.current);
+    skin.update(sim);
+    skin.shade(sim, under, underDimming, fade.current);
+    updateLattice(
+      sim,
+      buffers,
+      colors.c,
+      colors.deep,
+      colors.foam,
+      brightness,
+      under,
+    );
     syncDrawState(buffers.pointGeo, pointsMat.current, sim);
   });
 
   return (
     <>
+      <primitive object={skin.mesh} />
       <points geometry={buffers.pointGeo} frustumCulled={false}>
         <pointsMaterial
           ref={pointsMat}
@@ -422,8 +465,23 @@ function OverlapUpdater({
 // ---------------------------------------------------------------------------
 
 /** The tank: fixed coordinate grid (origin corner is 0,0,0; axes run to 100). */
-function Tank({ conductor }: { conductor: ViewTransition }) {
-  const grid = useMemo(() => createCoordinateGrid(TANK), []);
+function Tank({
+  conductor,
+  scene,
+}: {
+  conductor: ViewTransition;
+  scene: FinanceScene | null;
+}) {
+  // with finance data the axes read months, dollars and low-to-high, with a "today" line
+  const grid = useMemo(
+    () =>
+      createCoordinateGrid(
+        TANK,
+        scene ? { labels: scene.labels, today: scene.todayFraction } : {},
+      ),
+    [scene],
+  );
+  useEffect(() => () => grid.dispose(), [grid]);
   const edges = useRef<THREE.LineSegments>(null);
   const edgeMat = useRef<THREE.LineBasicMaterial>(null);
   const tankW = TANK.maxX - TANK.minX;
@@ -919,6 +977,8 @@ function SettingsMenu(props: {
   onDimming: (v: number) => void;
   overlapDimming: number;
   onOverlapDimming: (v: number) => void;
+  underDimming: number;
+  onUnderDimming: (v: number) => void;
   onReset: () => void;
 }) {
   const [open, setOpen] = useState(false);
@@ -976,6 +1036,11 @@ function SettingsMenu(props: {
               value={props.overlapDimming}
               onChange={props.onOverlapDimming}
             />
+            <Slider
+              label="Below-surface dimming"
+              value={props.underDimming}
+              onChange={props.onUnderDimming}
+            />
             <div className={collapsible(props.inGraph)} inert={!props.inGraph}>
               <div className="min-h-0 overflow-hidden">
                 <button
@@ -1023,6 +1088,10 @@ function FluidDock({
   onAdd: () => void;
 }) {
   const full = fluids.length >= maxFluids;
+  // finance categories can be opened in either view; hand-made graphs only in the graph view
+  const finance = fluids.some((f) => f.data);
+  const canOpen = inGraph || finance;
+  const canAdd = inGraph && !finance;
   return (
     <div
       role="group"
@@ -1033,15 +1102,16 @@ function FluidDock({
       }
     >
       {fluids.map((f, i) => {
-        const on = inGraph && panelOpen && f.id === selectedId;
+        const on = canOpen && panelOpen && f.id === selectedId;
+        const name = f.data ? f.data.label : `Graph ${i + 1}`;
         return (
           <button
             key={f.id}
             onClick={() => onSelect(f.id)}
-            inert={!inGraph}
-            aria-label={`Graph ${i + 1}`}
+            inert={!canOpen}
+            aria-label={name}
             aria-pressed={on}
-            title={inGraph ? `Graph ${i + 1}: edit` : `Graph ${i + 1}`}
+            title={f.data ? `${name} · ${formatUSD(f.data.amountAt(0))}` : inGraph ? `${name}: edit` : name}
             className={
               "flex items-center justify-center rounded-full p-0.5 " +
               PRESS +
@@ -1056,11 +1126,11 @@ function FluidDock({
       })}
       {/* the add rune folds away in the solar view */}
       <div
-        inert={!inGraph}
+        inert={!canAdd}
         className={
           "grid transition-[grid-template-columns,opacity] duration-500 " +
           "ease-[cubic-bezier(0.32,0.72,0,1)] motion-reduce:duration-150 " +
-          (inGraph
+          (canAdd
             ? "grid-cols-[1fr] opacity-100"
             : "grid-cols-[0fr] opacity-0")
         }
@@ -1103,12 +1173,46 @@ export default function FluidScene() {
   ]);
   const [dimming, setDimming] = useState(DEFAULT_DIMMING);
   const [overlapDimming, setOverlapDimming] = useState(DEFAULT_OVERLAP_DIMMING);
+  const [underDimming, setUnderDimming] = useState(DEFAULT_UNDER_DIMMING);
   const [view, setView] = useState<View>("graph");
   const [selectedId, setSelectedId] = useState(fluids[0].id);
   const [panelOpen, setPanelOpen] = useState(false); // the sidebar opens from the legend
   const overlap = useMemo(() => new OverlapField(), []);
   const conductor = useMemo(() => new ViewTransition(), []);
   const inGraph = view === "graph";
+
+  // ---- the user's finances: read, forecast, and turned into graphs and planets ----
+  const projection = useProjection();
+  const scene = useMemo(
+    () => (projection.data ? buildFinanceScene(projection.data) : null),
+    [projection.data],
+  );
+  const scrub = useMemo(() => new Scrub(), []);
+  const fluidsRef = useRef(fluids);
+  const syncedVersion = useRef<string | null>(null);
+  useEffect(() => {
+    fluidsRef.current = fluids;
+  }, [fluids]);
+  // When a new forecast arrives, turn it into graphs. Updating a graph refills its
+  // pool, which would yank a planet off its orbit, so a change that lands while the
+  // solar view is up waits until the user is back in the graph view.
+  useEffect(() => {
+    if (!scene || !inGraph || syncedVersion.current === scene.version) return;
+    syncedVersion.current = scene.version;
+    const prev = fluidsRef.current;
+    const same =
+      prev.length === scene.graphs.length &&
+      prev.every((f, i) => f.data?.key === scene.graphs[i].key);
+    const next = scene.graphs.map((g, i) => {
+      const entry = same
+        ? prev[i]
+        : createFluid(1000 + g.orbit, g.slot, FLUID_COLORS[g.orbit % FLUID_COLORS.length]);
+      entry.sim.setSurface(gridToWorldSurface(g.surface));
+      return { ...entry, expr: g.label, data: g };
+    });
+    setFluids(next);
+    setSelectedId((id) => (next.some((f) => f.id === id) ? id : next[0].id));
+  }, [scene, inGraph]);
   useEffect(() => {
     conductor.setTarget(view === "solar" ? 1 : 0);
   }, [conductor, view]);
@@ -1149,6 +1253,9 @@ export default function FluidScene() {
     0,
     fluids.findIndex((f) => f.id === selectedId),
   );
+  const selected = fluids[selectedIndex];
+  // in the graph view the open category stands out and the rest recede
+  const focusId = panelOpen && inGraph && selected.data ? selected.id : null;
   const closePanel = () => setPanelOpen(false);
   const setColor = (id: number, color: string) =>
     setFluids((prev) => prev.map((f) => (f.id === id ? { ...f, color } : f)));
@@ -1179,12 +1286,19 @@ export default function FluidScene() {
             conductor={conductor}
             overlap={overlap}
             overlapDimming={overlapDimming}
+            scrub={scrub}
           />
-          <Tank conductor={conductor} />
+          <Tank conductor={conductor} scene={scene} />
           <SolarSystem conductor={conductor} count={fluids.length} />
           <OverlapUpdater fluids={fluids} overlap={overlap} />
           {fluids.map((f) => (
-            <FluidLayer key={f.id} fluid={f} overlap={overlap} />
+            <FluidLayer
+              key={f.id}
+              fluid={f}
+              overlap={overlap}
+              underDimming={underDimming}
+              emphasis={focusId !== null && f.id !== focusId ? 0.22 : 1}
+            />
           ))}
           <Interaction
             fluids={fluids}
@@ -1209,6 +1323,8 @@ export default function FluidScene() {
         onDimming={setDimming}
         overlapDimming={overlapDimming}
         onOverlapDimming={setOverlapDimming}
+        underDimming={underDimming}
+        onUnderDimming={setUnderDimming}
         onReset={() => fluids.forEach((f) => f.sim.reset())}
       />
 
@@ -1221,16 +1337,29 @@ export default function FluidScene() {
         onSelect={selectFluid}
         onAdd={addFluid}
       />
-      <SurfacePanel
-        open={panelOpen && inGraph}
-        fluid={fluids[selectedIndex]}
-        number={selectedIndex + 1}
-        canRemove={fluids.length > 1}
-        onClose={closePanel}
-        onRemove={removeFluid}
-        onColor={setColor}
-        onApply={applySurface}
-      />
+      {selected.data && scene ? (
+        <CategoryPanel
+          open={panelOpen}
+          graph={selected.data}
+          scene={scene}
+          scrub={scrub}
+          onClose={closePanel}
+        />
+      ) : (
+        <SurfacePanel
+          open={panelOpen && inGraph}
+          fluid={selected}
+          number={selectedIndex + 1}
+          canRemove={fluids.length > 1}
+          onClose={closePanel}
+          onRemove={removeFluid}
+          onColor={setColor}
+          onApply={applySurface}
+        />
+      )}
+
+      {scene && <Scrubber scrub={scrub} scene={scene} show={!inGraph} />}
+      <AgentStatus state={projection} />
     </div>
   );
 }
