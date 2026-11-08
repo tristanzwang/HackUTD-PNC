@@ -10,6 +10,7 @@
 
 import { chooseModel } from "../agents/estimator";
 import { buildProjection, heuristicChoice, type Choice, type Projection } from "./projection";
+import snapshot from "./projection-snapshot.json";
 import { makePersona, type CategoryKey, type Persona } from "./synth";
 
 export const HORIZON = 24;
@@ -122,14 +123,28 @@ async function chooseAll(persona: Persona) {
 // cached entry point
 // ---------------------------------------------------------------------------
 
-type Cached = { version: string; result: Projection };
-let cache: Cached | null = null;
+type Cached = { version: string; result: Projection; stale: boolean };
+
+// Seed the cache from the snapshot built by scripts/build-snapshot.ts. A cold
+// serverless start then answers the first request from this instead of blocking
+// on ~9 Nemotron calls. It is keyed by its own `version`, so it is only served
+// while the current history hashes to that same version; a different hash (or
+// opts.force) falls through to a live run below. The file is `{}` until the
+// script has been run once, in which case there is no usable seed.
+let cache: Cached | null =
+  typeof (snapshot as Partial<Projection>).version === "string"
+    ? { version: (snapshot as Projection).version, result: snapshot as Projection, stale: true }
+    : null;
 let inflight: Promise<Projection> | null = null;
 export async function getProjection(opts: { force?: boolean } = {}): Promise<Projection> {
   const persona = await loadHistory();
   const version = versionOf(persona);
   // Same history, same answer: never re-spend model tokens on data we have already read.
-  if (cache && cache.version === version && !opts.force) return cache.result;
+  if (cache && cache.version === version && !opts.force) {
+    // Snapshot-seeded results are flagged stale so callers can tell a cached
+    // cold-start answer from one this process computed live.
+    return cache.stale ? { ...cache.result, stale: true } : cache.result;
+  }
   if (inflight) return inflight; // several polls at once share one set of model calls
 
   inflight = (async () => {
@@ -140,7 +155,7 @@ export async function getProjection(opts: { force?: boolean } = {}): Promise<Pro
         generatedAt: new Date().toISOString(),
         note,
       });
-      cache = { version, result };
+      cache = { version, result, stale: false };
       return result;
     } finally {
       inflight = null;

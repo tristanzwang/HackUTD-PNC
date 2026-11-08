@@ -66,6 +66,12 @@ export type Projection = {
     live: boolean;
     note?: string;
   };
+  /**
+   * True when this came from the pre-built snapshot rather than a live run in
+   * this process (a cold serverless start serves the snapshot before the first
+   * Nemotron call completes). A freshly built projection is always `false`.
+   */
+  stale: boolean;
 };
 
 /** A model's pick for one category, however it was made. */
@@ -246,5 +252,6 @@ export function buildProjection(
     categories,
     summary,
     agent: { live, note: meta.note },
+    stale: false,
   };
 }
