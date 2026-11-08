@@ -5,16 +5,19 @@ export const MAX_FLUIDS = 8;
 /** A new fluid is a flat pool this high on the 0-100 y axis. */
 export const DEFAULT_EXPR = "40";
 
-/** Default fluid colours (amber is left out: it marks stuck points). */
+/**
+ * Default fluid colours: soft, luminous gemstone and moonlight tones that glow
+ * against the night-blue scene. Amber is left out because it marks stuck points.
+ */
 export const FLUID_COLORS = [
-  "#1b5fd1", // blue
-  "#e5484d", // red
-  "#30a46c", // green
-  "#a855f7", // purple
-  "#06b6d4", // cyan
-  "#ec4899", // pink
-  "#84cc16", // lime
-  "#9aa4c7", // lavender grey
+  "#6c8cff", // sapphire
+  "#ff7b93", // rose quartz
+  "#4fd6b0", // jade
+  "#b88cff", // amethyst
+  "#5cc8f2", // aquamarine
+  "#f08fc8", // orchid
+  "#d9ea7a", // moonmoss
+  "#d4dcf2", // moonlight
 ];
 
 /**

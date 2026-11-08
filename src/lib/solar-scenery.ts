@@ -23,6 +23,29 @@ function pointsFrom(positions: Float32Array, material: THREE.PointsMaterial) {
   return pts;
 }
 
+/** A pastel orange sun: a pale peach core, glowing coral-orange at the edges. */
+const SUN_CORE = "#ffb98a";
+
+/**
+ * Smooth random wobble in about [-1, 1]: random values at whole-number times,
+ * eased between. Unlike a sine it never settles into a repeating beat.
+ */
+function makeWobble() {
+  const seed = Math.random() * 1000;
+  const at = (n: number) => {
+    const x = Math.sin(n * 127.1 + seed * 311.7) * 43758.5453;
+    return (x - Math.floor(x)) * 2 - 1;
+  };
+  const smooth = (t: number) => {
+    const i = Math.floor(t);
+    const f = t - i;
+    const u = f * f * (3 - 2 * f);
+    return at(i) * (1 - u) + at(i + 1) * u;
+  };
+  // three octaves: a slow swell, a gentler flutter, and a faint shimmer
+  return (t: number) => 0.55 * smooth(t * 0.5) + 0.3 * smooth(t * 1.25 + 17) + 0.15 * smooth(t * 2.7 + 41);
+}
+
 /**
  * The backdrop for the solar-system view: a sun and its glow, and one ring per
  * orbit, which fade in and out with the view transition; plus a starfield that
@@ -55,7 +78,7 @@ export function createSolarScenery(maxOrbits: number) {
   const sun = new THREE.Group();
   const core = new THREE.Mesh(
     new THREE.SphereGeometry(SUN_RADIUS, 32, 24),
-    track(new THREE.MeshBasicMaterial({ color: "#fff6dd", fog: false }), 1),
+    track(new THREE.MeshBasicMaterial({ color: SUN_CORE, fog: false, toneMapped: false }), 1),
   );
   core.renderOrder = -1;
   sun.add(core);
@@ -64,10 +87,12 @@ export function createSolarScenery(maxOrbits: number) {
     const sprite = new THREE.Sprite(
       track(
         new THREE.SpriteMaterial({
-          map: radialTexture(inner, "rgba(255,150,40,0)", stop),
+          map: radialTexture(inner, "rgba(255,160,110,0)", stop),
           blending: THREE.AdditiveBlending,
           depthWrite: false,
           fog: false,
+          // tone mapping would wash a bright orange out toward white
+          toneMapped: false,
         }),
         full,
       ),
@@ -77,9 +102,40 @@ export function createSolarScenery(maxOrbits: number) {
     sun.add(sprite);
     return sprite;
   };
-  const innerGlow = halo(INNER_GLOW, "rgba(255,226,160,0.95)", 0.16, 0.9);
-  const outerGlow = halo(OUTER_GLOW, "rgba(255,168,70,0.55)", 0.02, 0.75);
+  const innerGlow = halo(INNER_GLOW, "rgba(255,178,122,0.8)", 0.12, 0.8);
+  const outerGlow = halo(OUTER_GLOW, "rgba(255,150,104,0.45)", 0.02, 0.7);
   solarOnly.add(sun);
+
+  // ---- deeper orange glow: a few soft, uneven lobes that drift and swell at random ----
+  // Together they make a faint, lopsided gradient around the sun instead of a perfect
+  // circle, and it keeps changing shape along with the pulse.
+  const lobeTex = radialTexture("rgba(255,122,50,0.9)", "rgba(255,100,30,0)", 0);
+  const lobes = Array.from({ length: 6 }, () => {
+    const sprite = new THREE.Sprite(
+      track(
+        new THREE.SpriteMaterial({
+          map: lobeTex,
+          blending: THREE.AdditiveBlending,
+          depthWrite: false,
+          fog: false,
+          toneMapped: false,
+        }),
+        0.3,
+      ),
+    );
+    sprite.renderOrder = -1;
+    sun.add(sprite);
+    return {
+      sprite,
+      swell: makeWobble(),
+      drift: makeWobble(),
+      angle: Math.random() * Math.PI * 2,
+      spin: (Math.random() < 0.5 ? -1 : 1) * (0.04 + Math.random() * 0.1),
+      tilt: Math.random() * Math.PI,
+      reach: SUN_RADIUS * (0.5 + Math.random() * 1.1),
+      size: SUN_RADIUS * (5 + Math.random() * 4),
+    };
+  });
 
   // ---- orbit rings ----
   const rings: THREE.LineLoop[] = [];
@@ -145,6 +201,12 @@ export function createSolarScenery(maxOrbits: number) {
   const FADE = 1.0;
   const TANK_DIM = 0.9; // how much the centre is dimmed in the tank
 
+  // each part of the sun wobbles on its own random pattern, so it never pulses in lockstep
+  const wobbleCore = makeWobble();
+  const wobbleInner = makeWobble();
+  const wobbleOuter = makeWobble();
+  const coreColor = new THREE.Color(SUN_CORE);
+
   return {
     group,
     /** `p` is the view transition (0 = tank, 1 = solar); `t` is the orbital clock. */
@@ -169,8 +231,24 @@ export function createSolarScenery(maxOrbits: number) {
       for (const f of fades) f.mat.opacity = f.full * p;
       // the sun breathes, and swells into place as the view arrives
       sun.scale.setScalar(0.35 + 0.65 * p);
-      innerGlow.scale.setScalar(SUN_RADIUS * INNER_GLOW * (1 + Math.sin(t * 0.7) * 0.05));
-      outerGlow.scale.setScalar(SUN_RADIUS * OUTER_GLOW * (1 + Math.sin(t * 0.45) * 0.07));
+      const wc = wobbleCore(t);
+      const wi = wobbleInner(t);
+      const wo = wobbleOuter(t);
+      // subtle: the glows breathe in size and brightness by a few percent
+      innerGlow.scale.setScalar(SUN_RADIUS * INNER_GLOW * (1 + wi * 0.06));
+      outerGlow.scale.setScalar(SUN_RADIUS * OUTER_GLOW * (1 + wo * 0.08));
+      (innerGlow.material as THREE.SpriteMaterial).opacity = 0.9 * p * (1 + wi * 0.1);
+      (outerGlow.material as THREE.SpriteMaterial).opacity = 0.75 * p * (1 + wo * 0.14);
+      for (const l of lobes) {
+        const sw = l.swell(t);
+        const dr = l.drift(t);
+        const a = l.angle + t * l.spin + dr * 1.1;
+        const r = l.reach * (1 + 0.5 * dr);
+        l.sprite.position.set(Math.cos(a) * r, Math.sin(a * 0.7 + l.tilt) * r * 0.6, Math.sin(a) * r);
+        l.sprite.scale.setScalar(l.size * (1 + 0.28 * sw));
+        (l.sprite.material as THREE.SpriteMaterial).opacity = p * Math.max(0.28 + 0.22 * sw, 0);
+      }
+      (core.material as THREE.MeshBasicMaterial).color.copy(coreColor).multiplyScalar(0.94 + wc * 0.06);
       for (let i = 0; i < rings.length; i++) rings[i].visible = i < orbitsInUse;
     },
     dispose() {

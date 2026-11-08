@@ -399,7 +399,7 @@ function Tank({ conductor }: { conductor: ViewTransition }) {
     <>
       <primitive object={grid.group} />
       <lineSegments ref={edges} geometry={edgeGeo} position={[0, tankH / 2, 0]}>
-        <lineBasicMaterial ref={edgeMat} color="#8fb4ff" transparent opacity={0.25} />
+        <lineBasicMaterial ref={edgeMat} color="#dfe8ff" transparent opacity={0.25} />
       </lineSegments>
     </>
   );
@@ -434,6 +434,7 @@ function Interaction({
 }) {
   const cursor = useRef<THREE.Mesh>(null);
   const { camera, gl, scene } = useThree();
+  const aspect = useThree((st) => st.size.width / st.size.height);
 
   const live = useRef({ fluids, dimming });
   useEffect(() => {
@@ -478,10 +479,13 @@ function Interaction({
 
   // frame the whole system when the solar view is picked
   useEffect(() => {
-    input.current.zoom[1].to(
-      THREE.MathUtils.clamp(systemRadius(fluids.length) * 1.55 + 3.2, 5, 34),
-    );
-  }, [fluids.length]);
+    // The solar view looks straight down, so the outermost orbit has to fit the
+    // screen's *shorter* side (the vertical one on a wide window), planet and all.
+    const halfFov = THREE.MathUtils.degToRad((camera as THREE.PerspectiveCamera).fov / 2);
+    const reach = systemRadius(fluids.length) + 0.9;
+    const fit = (reach * 1.1) / (Math.tan(halfFov) * Math.min(1, aspect));
+    input.current.zoom[1].to(THREE.MathUtils.clamp(fit, 5, 44));
+  }, [fluids.length, aspect, camera]);
 
   useEffect(() => {
     const el = gl.domElement;

@@ -102,6 +102,15 @@ export class FluidSim {
   orbitX = 0;
   orbitY = 0;
   orbitZ = 0;
+  /**
+   * How far the whole fluid has been carried from where the tank is (see translate).
+   * The tank's walls and its surface graph travel with the fluid, so a planet that
+   * is already far out on its orbit while the transition is still blending isn't
+   * dragged back toward the tank by a wall that is no longer anywhere near it.
+   */
+  private shiftX = 0;
+  private shiftY = 0;
+  private shiftZ = 0;
   /** Fraction of a planet's whole-body spin removed each step (see despin). */
   despinRate = 0.05;
   /**
@@ -168,6 +177,7 @@ export class FluidSim {
    * surface graph, so the fluid falls and sloshes into its resting shape.
    */
   reset() {
+    this.shiftX = this.shiftY = this.shiftZ = 0;
     const s = this.spacing;
     const m = 0.04;
     const cols = Math.floor((TANK.maxX - TANK.minX - 2 * m) / s) + 1;
@@ -374,7 +384,7 @@ export class FluidSim {
         vel[i * 3 + 1] -= down;
         if (this.hasTilt) {
           // tilt gravity to be perpendicular to the shaped surface
-          const px = pos[i * 3], pz = pos[i * 3 + 2];
+          const px = pos[i * 3] - this.shiftX, pz = pos[i * 3 + 2] - this.shiftZ;
           vel[i * 3] += down * this.sampleSurface(this.surfGX, px, pz);
           vel[i * 3 + 2] += down * this.sampleSurface(this.surfGZ, px, pz);
         }
@@ -516,9 +526,10 @@ export class FluidSim {
       if (pinned[i]) continue;
       const j = i * 3;
       if (keep > 0) {
-        const cx = Math.min(Math.max(pos[j], TANK.minX + m), TANK.maxX - m);
-        const cy = Math.min(Math.max(pos[j + 1], TANK.minY + m), TANK.maxY - m);
-        const cz = Math.min(Math.max(pos[j + 2], TANK.minZ + m), TANK.maxZ - m);
+        const { shiftX: sx, shiftY: sy, shiftZ: sz } = this;
+        const cx = Math.min(Math.max(pos[j] - sx, TANK.minX + m), TANK.maxX - m) + sx;
+        const cy = Math.min(Math.max(pos[j + 1] - sy, TANK.minY + m), TANK.maxY - m) + sy;
+        const cz = Math.min(Math.max(pos[j + 2] - sz, TANK.minZ + m), TANK.maxZ - m) + sz;
         pos[j] += (cx - pos[j]) * keep;
         pos[j + 1] += (cy - pos[j + 1]) * keep;
         pos[j + 2] += (cz - pos[j + 2]) * keep;
@@ -666,6 +677,9 @@ export class FluidSim {
     this.orbitX += dx;
     this.orbitY += dy;
     this.orbitZ += dz;
+    this.shiftX += dx;
+    this.shiftY += dy;
+    this.shiftZ += dz;
   }
 
   /** Average particle position. */
