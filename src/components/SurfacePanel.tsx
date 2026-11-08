@@ -90,7 +90,7 @@ function SurfaceEditor({
   return (
     <div>
       <p className="text-sm text-white/55">
-        Surface height <span className="font-mono">h(x, z)</span> on the y axis (0–{AXIS_MAX})
+        Surface height h(x, z) on the y axis (0–{AXIS_MAX})
       </p>
 
       <div className="mt-2 flex gap-2">
@@ -207,7 +207,8 @@ export default function SurfacePanel({
       aria-label={`Graph ${number} settings`}
       className={
         "absolute right-5 top-[4.9rem] max-h-[calc(100vh-9.5rem)] w-80 origin-top-right select-none " +
-        "overflow-y-auto rounded-[1.25rem] p-5 text-white [scrollbar-width:thin] " +
+        "overflow-y-auto rounded-[1.75rem] p-5 text-white tabular-nums lining-nums " +
+        "[scrollbar-width:none] [&::-webkit-scrollbar]:hidden " +
         GLASS +
         " " +
         materialize(open)
@@ -216,7 +217,7 @@ export default function SurfacePanel({
       <div className="relative flex items-center gap-3">
         <Orb color={fluid.color} size={22} />
         <div className="min-w-0 flex-1">
-          <h2 className="text-xl font-semibold italic leading-none tracking-[-0.01em] text-white">
+          <h2 className="text-xl font-semibold leading-none tracking-[-0.01em] text-white">
             Graph {number}
           </h2>
           <p className="mt-1 text-sm text-white/45">{fluid.sim.count} points</p>

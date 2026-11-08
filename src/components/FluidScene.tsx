@@ -927,7 +927,7 @@ function SettingsMenu(props: {
     <div
       className={
         "rise absolute bottom-5 right-5 flex select-none flex-col-reverse overflow-hidden " +
-        "rounded-[1.25rem] text-white transition-[width] duration-500 " +
+        "rounded-[1.75rem] text-white transition-[width] duration-500 " +
         "ease-[cubic-bezier(0.32,0.72,0,1)] motion-reduce:duration-150 " +
         (open ? "w-64 " : "w-10 ") +
         GLASS
@@ -949,21 +949,18 @@ function SettingsMenu(props: {
         <svg
           width="16"
           height="16"
-          viewBox="0 0 16 16"
+          viewBox="0 0 24 24"
+          fill="none"
+          stroke="currentColor"
+          strokeWidth="2"
+          strokeLinecap="round"
+          strokeLinejoin="round"
           aria-hidden
           className="shrink-0"
         >
-          <g
-            fill="none"
-            stroke="currentColor"
-            strokeWidth="1.1"
-            strokeLinecap="round"
-          >
-            <path d="M2 4.5h12M2 8h12M2 11.5h12" opacity="0.55" />
-            <circle cx="10.5" cy="4.5" r="1.7" fill="#0b1226" />
-            <circle cx="5.5" cy="8" r="1.7" fill="#0b1226" />
-            <circle cx="9.5" cy="11.5" r="1.7" fill="#0b1226" />
-          </g>
+          {/* Lucide "settings" gear — the standard preferences glyph */}
+          <path d="M12.22 2h-.44a2 2 0 0 0-2 2v.18a2 2 0 0 1-1 1.73l-.43.25a2 2 0 0 1-2 0l-.15-.08a2 2 0 0 0-2.73.73l-.22.38a2 2 0 0 0 .73 2.73l.15.1a2 2 0 0 1 1 1.72v.51a2 2 0 0 1-1 1.74l-.15.09a2 2 0 0 0-.73 2.73l.22.38a2 2 0 0 0 2.73.73l.15-.08a2 2 0 0 1 2 0l.43.25a2 2 0 0 1 1 1.73V20a2 2 0 0 0 2 2h.44a2 2 0 0 0 2-2v-.18a2 2 0 0 1 1-1.73l.43-.25a2 2 0 0 1 2 0l.15.08a2 2 0 0 0 2.73-.73l.22-.39a2 2 0 0 0-.73-2.73l-.15-.08a2 2 0 0 1-1-1.74v-.5a2 2 0 0 1 1-1.74l.15-.09a2 2 0 0 0 .73-2.73l-.22-.38a2 2 0 0 0-2.73-.73l-.15.08a2 2 0 0 1-2 0l-.43-.25a2 2 0 0 1-1-1.73V4a2 2 0 0 0-2-2z" />
+          <circle cx="12" cy="12" r="3" />
         </svg>
       </button>
       <div id={panelId} className={collapsible(open)} inert={!open}>

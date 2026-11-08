@@ -13,8 +13,8 @@ const EASE = "ease-[cubic-bezier(0.32,0.72,0,1)]";
  * light catches it, and a deep shadow. Honours reduced-transparency and more-contrast.
  */
 export const GLASS =
-  "border border-white/[0.12] bg-[#0b1226]/65 backdrop-blur-2xl backdrop-saturate-150 " +
-  "shadow-[0_10px_40px_-8px_rgba(0,0,0,0.55),inset_0_1px_0_rgba(255,255,255,0.09)] " +
+  "border border-white/[0.14] bg-[#0b1226]/55 backdrop-blur-3xl backdrop-saturate-[1.8] " +
+  "shadow-[0_22px_60px_-16px_rgba(0,0,0,0.65),inset_0_1px_0_rgba(255,255,255,0.14)] " +
   "[@media(prefers-reduced-transparency:reduce)]:bg-[#0b1226] " +
   "[@media(prefers-reduced-transparency:reduce)]:backdrop-blur-none " +
   "contrast-more:border-white/50 contrast-more:bg-[#0b1226]";
