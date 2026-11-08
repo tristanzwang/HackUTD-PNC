@@ -34,6 +34,8 @@ const INTERIOR_AREA = (TANK.maxX - TANK.minX - 2 * WALL_MARGIN) * (TANK.maxZ - T
 const SETTLED_VOLUME = 1.2;
 /** Never fewer nodes than this, so a near-zero graph still shows a thin sheet of fluid. */
 const MIN_NODES = 60;
+/** A particle with fewer neighbours than this counts as thrown clear of the fluid. */
+const STRAY_NEIGHBORS = 6;
 /** Most stretched links drawn from any one pinned particle. */
 const STRETCH_LINKS = 8;
 /**
@@ -100,6 +102,15 @@ export class FluidSim {
   orbitX = 0;
   orbitY = 0;
   orbitZ = 0;
+  /** Fraction of a planet's whole-body spin removed each step (see despin). */
+  despinRate = 0.05;
+  /**
+   * Speed lost per second by a particle that has lost contact with the fluid,
+   * so a planet reabsorbs its splashes instead of keeping a ring of debris.
+   */
+  strayDrag = 1.4;
+  /** The spacing this fluid has in the tank, before any orbit packing. */
+  tankSpacing = 0;
   stiffness = 30;
   stiffnessNear = 60;
   viscosity = 0.15;
@@ -147,7 +158,8 @@ export class FluidSim {
     this.cellSize = this.h;
     const dim = Math.ceil(MAX_EXTENT / this.cellSize) + 2;
     this.gx = this.gy = this.gz = dim;
-    this.cellStart = new Int32Array(dim * dim * dim + 1);
+    const cells = dim * dim * dim + 1;
+    if (this.cellStart.length !== cells) this.cellStart = new Int32Array(cells);
     this.calibrate();
   }
 
@@ -239,6 +251,7 @@ export class FluidSim {
       sp = Math.cbrt(nominalVolume / this.capacity);
       n = this.capacity;
     }
+    this.tankSpacing = sp;
     this.configure(sp);
     this.count = Math.max(MIN_NODES, n);
     this.reset();
@@ -427,6 +440,24 @@ export class FluidSim {
       }
     }
 
+    // Particles knocked clear of a planet have no neighbours to slow them, so
+    // they would circle it forever. Bleed their speed and gravity reels them in.
+    if (b > 0 && this.strayDrag > 0) {
+      const k = this.strayDrag * b * dt;
+      for (let i = 0; i < n; i++) {
+        if (pinned[i]) continue;
+        const lonely = 1 - Math.min(nbrCount[i], STRAY_NEIGHBORS) / STRAY_NEIGHBORS;
+        if (lonely <= 0) continue;
+        const f = 1 - k * lonely;
+        vel[i * 3] *= f;
+        vel[i * 3 + 1] *= f;
+        vel[i * 3 + 2] *= f;
+      }
+    }
+
+    // a planet should stay a sphere, so take out any whole-body spin
+    if (b > 0) this.despin(this.despinRate * b);
+
     // advance positions
     for (let i = 0; i < n; i++) {
       const move = pinned[i] ? 0 : dt;
@@ -527,10 +558,101 @@ export class FluidSim {
     }
   }
 
+  /**
+   * Squeeze the particles closer together: 1 is tank density, lower packs the
+   * fluid tighter. Lowering the rest spacing leaves the fluid under-dense, so
+   * gravity draws it inward until it reaches the new density — the ball
+   * condenses rather than snapping to a smaller size.
+   */
+  setPacking(k: number) {
+    const target = this.tankSpacing * k;
+    if (Math.abs(target - this.spacing) > 1e-6) this.configure(target);
+  }
+
+  /**
+   * Bleed off whole-body rotation. Nothing else damps it: the viscosity model
+   * only acts between particles that are approaching each other, and a rigidly
+   * spinning ball has no such motion. Left alone, a planet keeps whatever spin
+   * it picked up while balling up, and centrifugal force slowly draws it out
+   * into an ellipsoid. `rate` is the fraction of the spin removed per step.
+   */
+  private despin(rate: number) {
+    const { count: n, pos, vel } = this;
+    if (n < 8 || rate <= 0) return;
+
+    let cx = 0, cy = 0, cz = 0, mvx = 0, mvy = 0, mvz = 0;
+    for (let i = 0; i < n; i++) {
+      cx += pos[i * 3]; cy += pos[i * 3 + 1]; cz += pos[i * 3 + 2];
+      mvx += vel[i * 3]; mvy += vel[i * 3 + 1]; mvz += vel[i * 3 + 2];
+    }
+    cx /= n; cy /= n; cz /= n; mvx /= n; mvy /= n; mvz /= n;
+
+    // angular momentum and inertia tensor about the centre of mass
+    let lx = 0, ly = 0, lz = 0;
+    let ixx = 0, iyy = 0, izz = 0, ixy = 0, ixz = 0, iyz = 0;
+    for (let i = 0; i < n; i++) {
+      const rx = pos[i * 3] - cx, ry = pos[i * 3 + 1] - cy, rz = pos[i * 3 + 2] - cz;
+      const ux = vel[i * 3] - mvx, uy = vel[i * 3 + 1] - mvy, uz = vel[i * 3 + 2] - mvz;
+      lx += ry * uz - rz * uy;
+      ly += rz * ux - rx * uz;
+      lz += rx * uy - ry * ux;
+      ixx += ry * ry + rz * rz;
+      iyy += rx * rx + rz * rz;
+      izz += rx * rx + ry * ry;
+      ixy -= rx * ry;
+      ixz -= rx * rz;
+      iyz -= ry * rz;
+    }
+
+    // omega = I^-1 L, by cofactors (the tensor is symmetric)
+    const c00 = iyy * izz - iyz * iyz;
+    const c01 = ixz * iyz - ixy * izz;
+    const c02 = ixy * iyz - ixz * iyy;
+    const det = ixx * c00 + ixy * c01 + ixz * c02;
+    if (!Number.isFinite(det) || Math.abs(det) < 1e-12) return;
+    const c11 = ixx * izz - ixz * ixz;
+    const c12 = ixy * ixz - ixx * iyz;
+    const c22 = ixx * iyy - ixy * ixy;
+    const wx = ((c00 * lx + c01 * ly + c02 * lz) / det) * rate;
+    const wy = ((c01 * lx + c11 * ly + c12 * lz) / det) * rate;
+    const wz = ((c02 * lx + c12 * ly + c22 * lz) / det) * rate;
+
+    for (let i = 0; i < n; i++) {
+      const rx = pos[i * 3] - cx, ry = pos[i * 3 + 1] - cy, rz = pos[i * 3 + 2] - cz;
+      vel[i * 3] -= wy * rz - wz * ry;
+      vel[i * 3 + 1] -= wz * rx - wx * rz;
+      vel[i * 3 + 2] -= wx * ry - wy * rx;
+    }
+  }
+
   /** Radius of the ball this fluid settles into around a gravity point. */
   get ballRadius() {
     const volume = this.count * this.spacing ** 3 * SETTLED_VOLUME;
     return Math.cbrt((volume * 3) / (4 * Math.PI));
+  }
+
+  /**
+   * Turn the fluid rigidly about its gravity point. Only positions move:
+   * velocities stay in the non-rotating frame, so the planet visibly spins
+   * without the centrifugal force that would pull it out of shape, and despin
+   * has nothing to fight.
+   */
+  spin(ax: number, ay: number, az: number, angle: number) {
+    const { count: n, pos } = this;
+    if (n === 0 || angle === 0) return;
+    const len = Math.hypot(ax, ay, az);
+    if (len < 1e-9) return;
+    const kx = ax / len, ky = ay / len, kz = az / len;
+    const c = Math.cos(angle), sn = Math.sin(angle), t = 1 - c;
+    const ox = this.orbitX, oy = this.orbitY, oz = this.orbitZ;
+    for (let i = 0; i < n; i++) {
+      const rx = pos[i * 3] - ox, ry = pos[i * 3 + 1] - oy, rz = pos[i * 3 + 2] - oz;
+      const dot = kx * rx + ky * ry + kz * rz;
+      // Rodrigues' rotation formula
+      pos[i * 3] = ox + rx * c + (ky * rz - kz * ry) * sn + kx * dot * t;
+      pos[i * 3 + 1] = oy + ry * c + (kz * rx - kx * rz) * sn + ky * dot * t;
+      pos[i * 3 + 2] = oz + rz * c + (kx * ry - ky * rx) * sn + kz * dot * t;
+    }
   }
 
   /** Move every particle rigidly, e.g. to carry a planet along its orbit. */

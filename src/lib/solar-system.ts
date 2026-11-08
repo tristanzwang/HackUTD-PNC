@@ -4,8 +4,8 @@
  * Pure math — no three.js, no DOM.
  */
 
-/** Radius of the central sun. */
-export const SUN_RADIUS = 0.8;
+/** Radius of the central sun: a small, very bright body. */
+export const SUN_RADIUS = 0.3;
 
 const INNER = 1.9; // radius of the first orbit
 const GAP = 1.3; // radial distance between orbits
@@ -54,6 +54,22 @@ export function orbitPosition(
   return out;
 }
 
+/**
+ * Each planet turns on its own slightly tilted axis, at its own rate and in its
+ * own direction, so no two look alike. This is a rigid turn of the dots only —
+ * see FluidSim.spin — so it never deforms the ball.
+ */
+export function spinAxis(index: number): [number, number, number] {
+  const tilt = 0.18 + ((index * 0.37) % 0.3);
+  const yaw = index * 1.31;
+  return [Math.sin(tilt) * Math.cos(yaw), Math.cos(tilt), Math.sin(tilt) * Math.sin(yaw)];
+}
+
+/** Radians per second, alternating direction down the orbits. */
+export function spinRate(index: number) {
+  return (index % 2 === 0 ? 1 : -1) * (0.22 + ((index * 0.29) % 0.2));
+}
+
 export const clamp01 = (t: number) => (t < 0 ? 0 : t > 1 ? 1 : t);
 export const easeInOutCubic = (t: number) =>
   t < 0.5 ? 4 * t * t * t : 1 - Math.pow(-2 * t + 2, 3) / 2;
@@ -72,21 +88,6 @@ export function transitionStages(p: number) {
     gather: easeInOutCubic(clamp01(p / 0.55)),
     launch: easeInOutCubic(clamp01((p - 0.25) / 0.75)),
   };
-}
-
-/** Evenly spread points on a sphere, for drawing the sun as a ball of dots. */
-export function fibonacciSphere(n: number, radius: number): Float32Array {
-  const out = new Float32Array(n * 3);
-  const golden = Math.PI * (3 - Math.sqrt(5));
-  for (let i = 0; i < n; i++) {
-    const y = n === 1 ? 0 : 1 - (i / (n - 1)) * 2;
-    const r = Math.sqrt(Math.max(1 - y * y, 0));
-    const a = golden * i;
-    out[i * 3] = Math.cos(a) * r * radius;
-    out[i * 3 + 1] = y * radius;
-    out[i * 3 + 2] = Math.sin(a) * r * radius;
-  }
-  return out;
 }
 
 /**

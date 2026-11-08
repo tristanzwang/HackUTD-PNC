@@ -1,5 +1,5 @@
 import * as THREE from "three";
-import { SUN_RADIUS, fibonacciSphere, orbitRadius, orbitTilt } from "./solar-system";
+import { SUN_RADIUS, orbitRadius, orbitTilt } from "./solar-system";
 
 /** A soft radial blob, used for the dots and for the sun's glow. */
 function radialTexture(inner: string, outer: string, stop = 0.5) {
@@ -43,40 +43,38 @@ export function createSolarScenery(maxOrbits: number) {
 
   const dot = radialTexture("#ffffff", "rgba(255,255,255,0)", 0.45);
 
-  // ---- sun: nested shells of dots, hottest in the middle ----
+  // ---- sun: a small sphere of light, wrapped in two additive halos ----
+  // The halos draw before the fluids (renderOrder -1) so that a planet passing
+  // behind the sun is painted over them rather than washed pale by them.
+  const INNER_GLOW = 3.6;
+  const OUTER_GLOW = 10;
   const sun = new THREE.Group();
-  const shells: { n: number; r: number; color: string; size: number; full: number }[] = [
-    { n: 900, r: 1, color: "#ffd27a", size: 0.1, full: 0.95 },
-    { n: 420, r: 0.74, color: "#ffb13c", size: 0.12, full: 0.8 },
-    { n: 160, r: 0.42, color: "#fff6d8", size: 0.15, full: 0.9 },
-  ];
-  for (const sh of shells) {
-    const mat = track(
-      new THREE.PointsMaterial({
-        size: sh.size,
-        sizeAttenuation: true,
-        color: sh.color,
-        map: dot,
-        depthWrite: false,
-        blending: THREE.AdditiveBlending,
-        fog: false,
-      }),
-      sh.full,
-    );
-    sun.add(pointsFrom(fibonacciSphere(sh.n, SUN_RADIUS * sh.r), mat));
-  }
-  const glowMat = track(
-    new THREE.SpriteMaterial({
-      map: radialTexture("rgba(255,196,92,0.85)", "rgba(255,140,30,0)", 0.06),
-      blending: THREE.AdditiveBlending,
-      depthWrite: false,
-      fog: false,
-    }),
-    0.85,
+  const core = new THREE.Mesh(
+    new THREE.SphereGeometry(SUN_RADIUS, 32, 24),
+    track(new THREE.MeshBasicMaterial({ color: "#fff6dd", fog: false }), 1),
   );
-  const glow = new THREE.Sprite(glowMat);
-  glow.scale.setScalar(SUN_RADIUS * 7);
-  sun.add(glow);
+  core.renderOrder = -1;
+  sun.add(core);
+
+  const halo = (scale: number, inner: string, stop: number, full: number) => {
+    const sprite = new THREE.Sprite(
+      track(
+        new THREE.SpriteMaterial({
+          map: radialTexture(inner, "rgba(255,150,40,0)", stop),
+          blending: THREE.AdditiveBlending,
+          depthWrite: false,
+          fog: false,
+        }),
+        full,
+      ),
+    );
+    sprite.scale.setScalar(SUN_RADIUS * scale);
+    sprite.renderOrder = -1;
+    sun.add(sprite);
+    return sprite;
+  };
+  const innerGlow = halo(INNER_GLOW, "rgba(255,226,160,0.95)", 0.16, 0.9);
+  const outerGlow = halo(OUTER_GLOW, "rgba(255,168,70,0.55)", 0.02, 0.75);
   group.add(sun);
 
   // ---- orbit rings ----
@@ -138,10 +136,10 @@ export function createSolarScenery(maxOrbits: number) {
       group.visible = p > 0.002;
       if (!group.visible) return;
       for (const f of fades) f.mat.opacity = f.full * p;
-      // the sun breathes, and settles into place as the view arrives
-      const pulse = 1 + Math.sin(t * 0.7) * 0.015;
-      sun.scale.setScalar(pulse * (0.35 + 0.65 * p));
-      glow.scale.setScalar(SUN_RADIUS * 7 * (1 + Math.sin(t * 0.45) * 0.04));
+      // the sun breathes, and swells into place as the view arrives
+      sun.scale.setScalar(0.35 + 0.65 * p);
+      innerGlow.scale.setScalar(SUN_RADIUS * INNER_GLOW * (1 + Math.sin(t * 0.7) * 0.05));
+      outerGlow.scale.setScalar(SUN_RADIUS * OUTER_GLOW * (1 + Math.sin(t * 0.45) * 0.07));
       for (let i = 0; i < rings.length; i++) rings[i].visible = i < orbitsInUse;
     },
     dispose() {

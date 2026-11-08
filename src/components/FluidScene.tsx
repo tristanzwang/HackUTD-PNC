@@ -19,6 +19,8 @@ import {
   clamp01,
   easeInOutCubic,
   orbitPosition,
+  spinAxis,
+  spinRate,
   systemRadius,
 } from "@/lib/solar-system";
 import SurfacePanel from "./SurfacePanel";
@@ -41,6 +43,8 @@ const TANK_CENTER = new THREE.Vector3(0, (TANK.maxY - TANK.minY) * 0.3, 0);
 const SUN_CENTER = new THREE.Vector3(0, 0, 0);
 /** How long the tank <-> solar system transition takes. */
 const TRANSITION_SECONDS = 2.6;
+/** How much tighter a planet's dots sit than the same water does in the tank. */
+const ORBIT_PACKING = 0.65;
 
 // cursor reach scales with a fluid's particle spacing so sparse fluids stay grabbable
 const splashRadius = (sim: FluidSim) => Math.max(0.16, 1.8 * sim.spacing);
@@ -126,6 +130,9 @@ function updateLattice(
   const { vel, pos } = sim;
   const { pointGeo, pointColors, lineGeo, linePos, lineCol, linkIdx, linkStretch } = buffers;
 
+  // Fast water turns to foam, but a planet should just be its own colour, so the
+  // effect fades out as the fluid balls up.
+  const foamK = 1 - sim.orbitBlend;
   const pc = pointColors.array as Float32Array;
   for (let i = 0; i < sim.count; i++) {
     const j = i * 3;
@@ -133,7 +140,9 @@ function updateLattice(
       c.copy(PIN_COLOR);
     } else {
       const speed = Math.hypot(vel[j], vel[j + 1], vel[j + 2]);
-      c.copy(deep).lerp(foam, Math.min(speed / 3.5, 1)).multiplyScalar(brightness[i]);
+      c.copy(deep)
+        .lerp(foam, Math.min(speed / 3.5, 1) * foamK)
+        .multiplyScalar(brightness[i]);
     }
     pc[j] = c.r;
     pc[j + 1] = c.g;
@@ -171,10 +180,17 @@ function updateLattice(
   lineGeo.setDrawRange(0, links * 2);
 }
 
+/**
+ * Dot size tracks the fluid's spacing, but shrinks less than orbit packing does
+ * — that is what makes a planet read as densely packed rather than merely small.
+ */
+const pointSize = (sim: FluidSim) =>
+  Math.max(sim.spacing, sim.tankSpacing * 0.95) * POINT_RATIO;
+
 /** Draw only the active nodes, and keep point size matched to the (possibly re-spaced) fluid. */
 function syncDrawState(geo: THREE.BufferGeometry, mat: THREE.PointsMaterial | null, sim: FluidSim) {
   geo.setDrawRange(0, sim.count);
-  if (mat) mat.size = sim.spacing * POINT_RATIO;
+  if (mat) mat.size = pointSize(sim);
 }
 
 /**
@@ -228,6 +244,7 @@ function SimDriver({
     live.current = { fluids, overlapDimming };
   }, [fluids, overlapDimming]);
   const tmp = useMemo(() => ({ orbit: [0, 0, 0] as [number, number, number] }), []);
+  const axes = useMemo(() => Array.from({ length: MAX_FLUIDS }, (_, i) => spinAxis(i)), []);
 
   useFrame((_, delta) => {
     const d = Math.min(delta, 0.05);
@@ -240,6 +257,8 @@ function SimDriver({
     list.forEach((f, i) => {
       const sim = f.sim;
       sim.orbitBlend = gather;
+      // the ball condenses as it forms, so planets are denser than their pools
+      sim.setPacking(1 - (1 - ORBIT_PACKING) * gather);
       if (c.p === 0) return;
 
       // the ball forms right where the water already is, then sets off
@@ -257,6 +276,8 @@ function SimDriver({
         home[1] + (tmp.orbit[1] - home[1]) * launch - sim.orbitY,
         home[2] + (tmp.orbit[2] - home[2]) * launch - sim.orbitZ,
       );
+      const axis = axes[i % axes.length];
+      sim.spin(axis[0], axis[1], axis[2], spinRate(i) * gather * d);
     });
 
     // planets are far apart in space, so overlap dimming only makes sense in the tank
@@ -305,7 +326,7 @@ function FluidLayer({ fluid, overlap }: { fluid: FluidEntry; overlap: OverlapFie
       <points geometry={buffers.pointGeo} frustumCulled={false}>
         <pointsMaterial
           ref={pointsMat}
-          size={sim.spacing * POINT_RATIO}
+          size={pointSize(sim)}
           sizeAttenuation
           vertexColors
           map={getSprite()}
